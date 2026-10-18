@@ -1,4 +1,5 @@
-OUTPUT_DIR := Ouput
+OUTPUT_DIR := Output
+BINARY := Formicary
 
 .PHONY: all build build-ui build-server run clean
 
@@ -11,10 +12,13 @@ build-ui:
 	npm run build --prefix ui
 
 build-server:
-	CARGO_TARGET_DIR=$(OUTPUT_DIR) cargo build --release
+	cargo build --release
+	mkdir -p $(OUTPUT_DIR)
+	cp target/release/$(BINARY) $(OUTPUT_DIR)/$(BINARY)
 
 run: build
-	CARGO_TARGET_DIR=$(OUTPUT_DIR) cargo run --release
+	./$(OUTPUT_DIR)/$(BINARY)
 
 clean:
-	rm -rf $(OUTPUT_DIR)
+	cargo clean
+	rm -rf $(OUTPUT_DIR) ui/dist
