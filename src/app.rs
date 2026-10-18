@@ -51,11 +51,22 @@ pub fn load_config() -> io::Result<Config> {
 
 pub fn run() -> io::Result<()> {
     let config = load_config()?;
-    let database = initialize(&config)
+    let mut database = initialize(&config)
         .map_err(|error| io::Error::other(format!("could not initialize application: {error}")))?;
 
     let listener = TcpListener::bind((config.host.as_str(), config.port))?;
-    println!("HTTP server listening on http://{}", listener.local_addr()?);
+    let address = listener.local_addr()?;
+    println!("HTTP server listening on http://{address}");
+    let control_host = match config.host.as_str() {
+        "0.0.0.0" | "::" => "localhost",
+        host => host.trim_matches(['[', ']']),
+    };
+    let control_host = if control_host.contains(':') {
+        format!("[{control_host}]")
+    } else {
+        control_host.to_owned()
+    };
+    println!("管理控制面板: http://{control_host}:{}/ui", address.port());
 
     for connection in listener.incoming() {
         let mut stream = match connection {
@@ -68,7 +79,7 @@ pub fn run() -> io::Result<()> {
 
         match http::read_request(&stream) {
             Ok(Some(request)) => {
-                let response = handle_request(&request, &database);
+                let response = handle_request(&request, &mut database);
                 http::write_response(&mut stream, &response, request.method == "HEAD")?;
             }
             Ok(None) => {}
@@ -112,7 +123,7 @@ pub fn initialize(config: &Config) -> Result<Connection, Box<dyn Error>> {
     Ok(database)
 }
 
-fn handle_request(request: &Request, database: &Connection) -> Response {
+fn handle_request(request: &Request, database: &mut Connection) -> Response {
     if api::is_api_path(&request.path) {
         return match api::handle(request, database) {
             Ok(response) => response,

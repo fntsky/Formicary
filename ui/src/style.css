@@ -148,10 +148,22 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   box-shadow: 0 20px 65px rgba(28, 51, 35, 0.08);
 }
 
+.dashboard-card { padding-top: 30px; }
+
 .auth-card .eyebrow { margin: 0 0 10px; }
 .auth-card h2 { margin: 0; color: #22362b; font-size: 25px; font-weight: 600; letter-spacing: -0.7px; }
 .card-description { margin: 9px 0 26px; color: #849087; font-size: 13px; line-height: 1.6; }
 .card-description strong { color: #315c42; font-weight: 600; }
+
+.settings-section {
+  margin-top: 21px;
+  padding-top: 18px;
+  border-top: 1px solid #edf0ec;
+}
+
+.settings-section h3 { margin: 0 0 15px; color: #31473a; font-size: 14px; font-weight: 650; }
+.dashboard-card .auth-form input { margin-bottom: 13px; }
+.dashboard-card .primary-button { margin-top: 3px; }
 
 .auth-form { display: flex; flex-direction: column; }
 .auth-form label { margin: 0 0 8px; color: #45534a; font-size: 12px; font-weight: 600; }
@@ -170,6 +182,7 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 .auth-form input::placeholder { color: #b2bbb4; }
 .auth-form input:focus { border-color: #82ab8c; outline: none; box-shadow: 0 0 0 3px rgba(130, 171, 140, 0.15); }
 .error-message { margin: -5px 0 14px; color: #b74444; font-size: 12px; line-height: 1.5; }
+.notice-message { margin: 0 0 14px; color: #36734c; font-size: 12px; line-height: 1.5; }
 
 .primary-button {
   display: flex;
@@ -195,6 +208,22 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 
 .text-button { padding: 3px 4px; border: 0; background: none; color: #2c6b49; cursor: pointer; font-size: inherit; font-weight: 600; }
 .text-button:hover { color: #18442e; text-decoration: underline; }
+
+.secondary-button {
+  width: 100%;
+  min-height: 43px;
+  margin: 18px 0 24px;
+  border: 1px solid #dce5dc;
+  border-radius: 8px;
+  background: #fff;
+  color: #52645a;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.secondary-button:hover:not(:disabled) { background: #f6f9f6; }
+.secondary-button:disabled { cursor: wait; opacity: 0.72; }
 
 .card-footer {
   display: flex;
