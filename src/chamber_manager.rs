@@ -134,7 +134,7 @@ impl ChamberManager {
             let source = fs::read_to_string(&config_path).map_err(|error| {
                 manager_io_error(&config_path, "could not read Chamber configuration", error)
             })?;
-            let config: ChamberFile = toml::from_str(&source).map_err(|error| {
+            let config = parse_chamber_file(&source).map_err(|error| {
                 validation_error(&config_path, format!("invalid TOML: {error}"))
             })?;
 
@@ -337,6 +337,10 @@ fn default_enabled() -> bool {
     true
 }
 
+fn parse_chamber_file(source: &str) -> Result<ChamberFile, toml::de::Error> {
+    toml::from_str(source)
+}
+
 fn parse_timeout(value: &str) -> Result<Duration, String> {
     let (digits, multiplier) = if let Some(digits) = value.strip_suffix("ms") {
         (digits, 1_u64)
@@ -380,3 +384,7 @@ fn manager_io_error(
 fn validation_error(path: impl AsRef<Path>, message: impl fmt::Display) -> ChamberManagerError {
     ChamberManagerError(format!("{}: {message}", path.as_ref().display()))
 }
+
+#[cfg(test)]
+#[path = "tests/chamber_manager_tests.rs"]
+mod tests;
