@@ -17,6 +17,7 @@ const MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1000;
 pub struct ChamberManager {
     chambers: Vec<ManagedChamber>,
     static_web_mounts: Vec<StaticWebMount>,
+    proxy_http_mounts: Vec<ProxyHttpMount>,
 }
 
 struct ManagedChamber {
@@ -34,6 +35,15 @@ pub struct ChamberSummary {
 #[derive(Clone, Debug)]
 pub struct StaticWebMount {
     pub directory: PathBuf,
+    pub route: String,
+    pub config_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyHttpMount {
+    pub working_directory: PathBuf,
+    pub script: String,
+    pub upstream: String,
     pub route: String,
     pub config_path: PathBuf,
 }
@@ -58,6 +68,9 @@ struct ChamberFile {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_staticweb")]
     staticweb: Vec<StaticWebFile>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_proxyhttp")]
+    proxyhttp: Vec<ProxyHttpFile>,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +99,16 @@ struct StaticWebFile {
     route: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyHttpFile {
+    #[serde(default)]
+    working_directory: Option<String>,
+    script: String,
+    upstream: String,
+    route: String,
+}
+
 fn deserialize_staticweb<'de, D>(deserializer: D) -> Result<Vec<StaticWebFile>, D::Error>
 where
     D: Deserializer<'de>,
@@ -100,6 +123,23 @@ where
     Ok(match StaticWebEntries::deserialize(deserializer)? {
         StaticWebEntries::Multiple(entries) => entries,
         StaticWebEntries::Single(entry) => vec![entry],
+    })
+}
+
+fn deserialize_proxyhttp<'de, D>(deserializer: D) -> Result<Vec<ProxyHttpFile>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ProxyHttpEntries {
+        Multiple(Vec<ProxyHttpFile>),
+        Single(ProxyHttpFile),
+    }
+
+    Ok(match ProxyHttpEntries::deserialize(deserializer)? {
+        ProxyHttpEntries::Multiple(entries) => entries,
+        ProxyHttpEntries::Single(entry) => vec![entry],
     })
 }
 
@@ -135,7 +175,8 @@ impl ChamberManager {
 
         let mut prepared = Vec::new();
         let mut static_web_mounts = Vec::new();
-        let mut static_web_routes = HashSet::new();
+        let mut proxy_http_mounts = Vec::new();
+        let mut mount_routes = HashSet::new();
         for entry in entries {
             let entry_type = entry.file_type().map_err(|error| {
                 manager_io_error(&entry.path(), "could not inspect directory entry", error)
@@ -202,16 +243,16 @@ impl ChamberManager {
 
             for static_web in config.staticweb {
                 let route =
-                    crate::app::normalize_static_prefix(&static_web.route).map_err(|error| {
+                    crate::app::normalize_route_prefix(&static_web.route).map_err(|error| {
                         validation_error(
                             &config_path,
                             format!("staticweb route {:?}: {error}", static_web.route),
                         )
                     })?;
-                if !static_web_routes.insert(route.clone()) {
+                if !mount_routes.insert(route.clone()) {
                     return Err(validation_error(
                         &config_path,
-                        format!("duplicate staticweb route {route:?}"),
+                        format!("duplicate mount route {route:?}"),
                     ));
                 }
 
@@ -242,6 +283,67 @@ impl ChamberManager {
 
                 static_web_mounts.push(StaticWebMount {
                     directory: static_directory,
+                    route,
+                    config_path: config_path.clone(),
+                });
+            }
+
+            for proxy in config.proxyhttp {
+                let route = crate::app::normalize_route_prefix(&proxy.route).map_err(|error| {
+                    validation_error(
+                        &config_path,
+                        format!("proxyhttp route {:?}: {error}", proxy.route),
+                    )
+                })?;
+                if !mount_routes.insert(route.clone()) {
+                    return Err(validation_error(
+                        &config_path,
+                        format!("duplicate mount route {route:?}"),
+                    ));
+                }
+                if proxy.script.trim().is_empty() {
+                    return Err(validation_error(
+                        &config_path,
+                        format!("proxyhttp route {route:?}: script must not be empty"),
+                    ));
+                }
+                crate::proxy_http::validate_upstream(&proxy.upstream).map_err(|error| {
+                    validation_error(
+                        &config_path,
+                        format!("proxyhttp route {route:?}: invalid upstream: {error}"),
+                    )
+                })?;
+
+                let configured_directory =
+                    PathBuf::from(proxy.working_directory.as_deref().unwrap_or("."));
+                let directory_path = if configured_directory.is_absolute() {
+                    configured_directory
+                } else {
+                    directory.join(configured_directory)
+                };
+                let working_directory = fs::canonicalize(&directory_path).map_err(|error| {
+                    validation_error(
+                        &config_path,
+                        format!(
+                            "proxyhttp route {route:?}: could not access working_directory {}: {error}",
+                            directory_path.display()
+                        ),
+                    )
+                })?;
+                if !working_directory.is_dir() {
+                    return Err(validation_error(
+                        &config_path,
+                        format!(
+                            "proxyhttp route {route:?}: working_directory is not a directory: {}",
+                            working_directory.display()
+                        ),
+                    ));
+                }
+
+                proxy_http_mounts.push(ProxyHttpMount {
+                    working_directory,
+                    script: proxy.script,
+                    upstream: proxy.upstream,
                     route,
                     config_path: config_path.clone(),
                 });
@@ -357,11 +459,16 @@ impl ChamberManager {
         Ok(Self {
             chambers,
             static_web_mounts,
+            proxy_http_mounts,
         })
     }
 
     pub fn static_web_mounts(&self) -> &[StaticWebMount] {
         &self.static_web_mounts
+    }
+
+    pub fn proxy_http_mounts(&self) -> &[ProxyHttpMount] {
+        &self.proxy_http_mounts
     }
 
     pub fn summaries(&self) -> Vec<ChamberSummary> {

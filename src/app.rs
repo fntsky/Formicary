@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use crate::http::{Request, Response};
-use crate::{api, chamber::ChamberManager, http, migrations, ui};
+use crate::{api, chamber::ChamberManager, http, migrations, proxy_http::ProxyMount, ui};
 
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 53212;
@@ -28,7 +28,13 @@ struct StaticDirectory {
 
 #[derive(Debug, Clone, Default)]
 pub struct App {
-    static_directories: Arc<RwLock<Vec<StaticDirectory>>>,
+    mounts: Arc<RwLock<MountRegistry>>,
+}
+
+#[derive(Debug, Default)]
+struct MountRegistry {
+    static_directories: Vec<StaticDirectory>,
+    proxy_http: Vec<ProxyMount>,
 }
 
 impl App {
@@ -47,7 +53,7 @@ impl App {
         path: impl AsRef<std::path::Path>,
         prefix: impl AsRef<str>,
     ) -> io::Result<()> {
-        let prefix = normalize_static_prefix(prefix.as_ref())?;
+        let prefix = normalize_route_prefix(prefix.as_ref())?;
         let path = fs::canonicalize(path)?;
         if !path.is_dir() {
             return Err(invalid_config(format!(
@@ -56,34 +62,99 @@ impl App {
             )));
         }
 
-        let mut static_directories = self
-            .static_directories
+        let mut mounts = self
+            .mounts
             .write()
-            .map_err(|_| io::Error::other("static directory registry is unavailable"))?;
-        if static_directories
+            .map_err(|_| io::Error::other("mount registry is unavailable"))?;
+        if mounts
+            .static_directories
             .iter()
             .any(|mount| mount.prefix == prefix)
+            || mounts.proxy_http.iter().any(|mount| mount.route == prefix)
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                format!("static URL prefix {prefix:?} is already registered"),
+                format!("URL prefix {prefix:?} is already registered"),
             ));
         }
 
-        static_directories.push(StaticDirectory { path, prefix });
+        mounts
+            .static_directories
+            .push(StaticDirectory { path, prefix });
         Ok(())
     }
 
     /// Unmounts the directory registered at `prefix`; returns `false` if absent.
     pub fn unregister_static_directory(&self, prefix: impl AsRef<str>) -> io::Result<bool> {
-        let prefix = normalize_static_prefix(prefix.as_ref())?;
-        let mut static_directories = self
-            .static_directories
+        let prefix = normalize_route_prefix(prefix.as_ref())?;
+        let mut mounts = self
+            .mounts
             .write()
-            .map_err(|_| io::Error::other("static directory registry is unavailable"))?;
-        let original_len = static_directories.len();
-        static_directories.retain(|mount| mount.prefix != prefix);
-        Ok(static_directories.len() != original_len)
+            .map_err(|_| io::Error::other("mount registry is unavailable"))?;
+        let original_len = mounts.static_directories.len();
+        mounts
+            .static_directories
+            .retain(|mount| mount.prefix != prefix);
+        Ok(mounts.static_directories.len() != original_len)
+    }
+
+    /// Starts and mounts a local service behind an HTTP route.
+    ///
+    /// `script` runs as shell text in `working_directory` and should keep the
+    /// service in the foreground. Unregistering the route terminates its process
+    /// group after requests already using the mount have finished.
+    pub fn register_proxy_http(
+        &self,
+        working_directory: impl AsRef<std::path::Path>,
+        script: impl AsRef<str>,
+        route: impl AsRef<str>,
+        upstream: impl AsRef<str>,
+    ) -> io::Result<()> {
+        let route = normalize_route_prefix(route.as_ref())?;
+        let working_directory = fs::canonicalize(working_directory)?;
+        if !working_directory.is_dir() {
+            return Err(invalid_config(format!(
+                "proxyhttp working path is not a directory: {}",
+                working_directory.display()
+            )));
+        }
+
+        let mut mounts = self
+            .mounts
+            .write()
+            .map_err(|_| io::Error::other("mount registry is unavailable"))?;
+        if mounts
+            .static_directories
+            .iter()
+            .any(|mount| mount.prefix == route)
+            || mounts.proxy_http.iter().any(|mount| mount.route == route)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("URL prefix {route:?} is already registered"),
+            ));
+        }
+
+        let mount = ProxyMount::start(
+            &working_directory,
+            script.as_ref(),
+            route,
+            upstream.as_ref(),
+        )?;
+        mounts.proxy_http.push(mount);
+        Ok(())
+    }
+
+    /// Unmounts a proxy route and stops its configured service process.
+    pub fn unregister_proxy_http(&self, route: impl AsRef<str>) -> io::Result<bool> {
+        let route = normalize_route_prefix(route.as_ref())?;
+        let mut mounts = self
+            .mounts
+            .write()
+            .map_err(|_| io::Error::other("mount registry is unavailable"))?;
+        let original_len = mounts.proxy_http.len();
+        mounts.proxy_http.retain(|mount| mount.route != route);
+        Ok(mounts.proxy_http.len() != original_len)
     }
 
     /// Runs the server on a background thread using a shared, live mount registry.
@@ -147,21 +218,39 @@ fn run_server(app: &App) -> io::Result<()> {
     let config = load_config()?;
     let chambers = ChamberManager::load(&config.chambers_dir)
         .map_err(|error| io::Error::other(format!("could not load Chambers: {error}")))?;
-    for mount in chambers.static_web_mounts() {
-        app.register_static_directory(&mount.directory, &mount.route)
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "{}: could not register staticweb route {:?}: {error}",
-                    mount.config_path.display(),
-                    mount.route
-                ))
-            })?;
-    }
     let mut database = initialize(&config)
         .map_err(|error| io::Error::other(format!("could not initialize application: {error}")))?;
-
     let listener = TcpListener::bind((config.host.as_str(), config.port))?;
     let address = listener.local_addr()?;
+    let mut registered_static_routes = Vec::new();
+    let mut registered_proxy_routes = Vec::new();
+    for mount in chambers.static_web_mounts() {
+        if let Err(error) = app.register_static_directory(&mount.directory, &mount.route) {
+            rollback_mounts(app, &registered_static_routes, &registered_proxy_routes);
+            return Err(io::Error::other(format!(
+                "{}: could not register staticweb route {:?}: {error}",
+                mount.config_path.display(),
+                mount.route
+            )));
+        }
+        registered_static_routes.push(mount.route.clone());
+    }
+    for mount in chambers.proxy_http_mounts() {
+        if let Err(error) = app.register_proxy_http(
+            &mount.working_directory,
+            &mount.script,
+            &mount.route,
+            &mount.upstream,
+        ) {
+            rollback_mounts(app, &registered_static_routes, &registered_proxy_routes);
+            return Err(io::Error::other(format!(
+                "{}: could not register proxyhttp route {:?}: {error}",
+                mount.config_path.display(),
+                mount.route
+            )));
+        }
+        registered_proxy_routes.push(mount.route.clone());
+    }
     println!("HTTP server listening on http://{address}");
     let control_host = match config.host.as_str() {
         "0.0.0.0" | "::" => "localhost",
@@ -185,10 +274,10 @@ fn run_server(app: &App) -> io::Result<()> {
 
         match http::read_request(&stream) {
             Ok(Some(request)) => {
-                let static_directories = match app.static_directories.read() {
-                    Ok(static_directories) => static_directories.clone(),
+                let mounts = match app.mounts.read() {
+                    Ok(mounts) => (mounts.static_directories.clone(), mounts.proxy_http.clone()),
                     Err(_) => {
-                        eprintln!("Static directory registry is unavailable");
+                        eprintln!("Mount registry is unavailable");
                         let response = Response::json(
                             "500 Internal Server Error",
                             json!({"error": "服务器内部错误。"}),
@@ -198,7 +287,7 @@ fn run_server(app: &App) -> io::Result<()> {
                     }
                 };
                 let response =
-                    handle_request(&request, &mut database, &chambers, &static_directories);
+                    handle_request(&request, &mut database, &chambers, &mounts.0, &mounts.1);
                 http::write_response(&mut stream, &response, request.method == "HEAD")?;
             }
             Ok(None) => {}
@@ -214,6 +303,15 @@ fn run_server(app: &App) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn rollback_mounts(app: &App, static_routes: &[String], proxy_routes: &[String]) {
+    for route in proxy_routes.iter().rev() {
+        let _ = app.unregister_proxy_http(route);
+    }
+    for route in static_routes.iter().rev() {
+        let _ = app.unregister_static_directory(route);
+    }
 }
 
 pub fn initialize(config: &Config) -> Result<Connection, Box<dyn Error>> {
@@ -247,6 +345,7 @@ fn handle_request(
     database: &mut Connection,
     chambers: &ChamberManager,
     static_directories: &[StaticDirectory],
+    proxy_http: &[ProxyMount],
 ) -> Response {
     if api::is_api_path(&request.path) {
         return match api::handle(request, database, chambers) {
@@ -261,16 +360,53 @@ fn handle_request(
         };
     }
 
+    enum Route<'a> {
+        Static(&'a StaticDirectory),
+        Proxy(&'a ProxyMount),
+    }
+    let best_static = static_directories
+        .iter()
+        .filter(|mount| matches_prefix(&request.path, &mount.prefix))
+        .max_by_key(|mount| mount.prefix.len());
+    let best_proxy = proxy_http
+        .iter()
+        .filter(|mount| mount.matches(&request.path))
+        .max_by_key(|mount| mount.route.len());
+    let route = match (best_static, best_proxy) {
+        (Some(static_mount), Some(proxy_mount))
+            if proxy_mount.route.len() > static_mount.prefix.len() =>
+        {
+            Some(Route::Proxy(proxy_mount))
+        }
+        (Some(static_mount), _) => Some(Route::Static(static_mount)),
+        (None, Some(proxy_mount)) => Some(Route::Proxy(proxy_mount)),
+        (None, None) => None,
+    };
+    if let Some(route) = route {
+        return match route {
+            Route::Proxy(mount) => mount.forward(request),
+            Route::Static(mount) if request.method == "GET" || request.method == "HEAD" => {
+                let relative_path = request
+                    .path
+                    .strip_prefix(&mount.prefix)
+                    .unwrap_or_default()
+                    .trim_start_matches('/');
+                serve_static_file(mount, relative_path)
+            }
+            Route::Static(_) => Response::new(
+                "405 Method Not Allowed",
+                "text/plain; charset=utf-8",
+                b"Method not allowed\n".to_vec(),
+            ),
+        };
+    }
+
     if request.method != "GET" && request.method != "HEAD" {
         return Response::new(
             "405 Method Not Allowed",
             "text/plain; charset=utf-8",
             b"Method not allowed\n".to_vec(),
         );
-    }
-
-    if let Some(response) = handle_static_directory(&request.path, static_directories) {
-        return response;
     }
 
     if ui::is_ui_path(&request.path) {
@@ -292,7 +428,7 @@ fn handle_request(
     }
 }
 
-pub(crate) fn normalize_static_prefix(prefix: &str) -> io::Result<String> {
+pub(crate) fn normalize_route_prefix(prefix: &str) -> io::Result<String> {
     let prefix = prefix.trim_matches('/');
     let invalid = prefix.is_empty()
         || prefix.split('/').any(|segment| {
@@ -306,35 +442,24 @@ pub(crate) fn normalize_static_prefix(prefix: &str) -> io::Result<String> {
         });
     if invalid {
         return Err(invalid_config(
-            "static URL prefix must contain valid, non-empty path segments",
+            "URL route must contain valid, non-empty path segments",
         ));
     }
 
     if matches!(prefix.split('/').next(), Some("api" | "ui")) {
         return Err(invalid_config(
-            "static URL prefixes cannot use the reserved /api or /ui paths",
+            "URL routes cannot use the reserved /api or /ui paths",
         ));
     }
 
     Ok(format!("/{prefix}"))
 }
 
-fn handle_static_directory(path: &str, mounts: &[StaticDirectory]) -> Option<Response> {
-    let mount = mounts
-        .iter()
-        .filter(|mount| {
-            path == mount.prefix
-                || path
-                    .strip_prefix(&mount.prefix)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        })
-        .max_by_key(|mount| mount.prefix.len())?;
-
-    let relative_path = path
-        .strip_prefix(&mount.prefix)
-        .unwrap_or_default()
-        .trim_start_matches('/');
-    Some(serve_static_file(mount, relative_path))
+fn matches_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn serve_static_file(mount: &StaticDirectory, relative_path: &str) -> Response {

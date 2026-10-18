@@ -55,6 +55,12 @@ timeout = "30s"
 [staticweb]
 directory = "./public"
 route = "/assets"
+
+[proxyhttp]
+working_directory = "."
+script = "./start-api.sh"
+upstream = "http://127.0.0.1:3000"
+route = "/api-proxy"
 ```
 
 规则：
@@ -64,6 +70,7 @@ route = "/assets"
 - 每个 Job 必须提供 `name`、`cron`、`working_directory`、`command` 和 `timeout`。
 - `enabled` 可省略，省略时默认为 `true`；设为 `false` 时，Job 会被加载但以暂停状态启动。
 - `[staticweb]` 可省略，用于配置一个静态目录及其 URL route；需要多个挂载时使用重复的 `[[staticweb]]`。
+- `[proxyhttp]` 可省略，用于启动一个本地 HTTP 服务并将 route 转发到它；需要多个服务时使用重复的 `[[proxyhttp]]`。
 - 未识别的字段应视为配置错误，避免拼写错误导致配置被忽略。
 
 ## 3. Job 字段
@@ -86,21 +93,36 @@ route = "/assets"
 | `directory` | 字符串 | 必填；静态文件目录。相对路径以当前 `chamber.toml` 所在目录为基准；也可使用绝对路径。目录必须存在。 |
 | `route` | 字符串 | 必填；URL 挂载前缀，例如 `/assets`。可省略开头和结尾的 `/`。跨所有 Chamber 的规范化 route 必须唯一；`/api` 和 `/ui` 前缀保留给应用。 |
 
-启动时，Chamber 加载器解析并校验目录和 route，然后将其注册到应用的静态目录挂载表。访问 `/assets/logo.svg` 会读取 `directory/logo.svg`；访问挂载前缀或目录路径时会尝试返回该目录下的 `index.html`。只响应 `GET` 和 `HEAD`。重叠 route 按最长前缀优先匹配。目录越界路径及指向挂载目录外的符号链接不会被提供。
+启动时，Chamber 加载器解析并校验目录和 route，然后将其注册到应用的挂载表。访问 `/assets/logo.svg` 会读取 `directory/logo.svg`；访问挂载前缀或目录路径时会尝试返回该目录下的 `index.html`。只响应 `GET` 和 `HEAD`。重叠 route 按最长前缀优先匹配。目录越界路径及指向挂载目录外的符号链接不会被提供。
 
-挂载 route 在所有已加载的 Chamber 之间必须唯一。运行期间可通过共享的 `App` 句柄动态增加或注销挂载；这类运行时改动不会写回 `chamber.toml`。修改 TOML 配置仍需重启服务。
+`staticweb` 与 `proxyhttp` 的规范化 route 在所有已加载的 Chamber 之间必须唯一。运行期间可通过共享的 `App` 句柄动态增加或注销挂载；这类运行时改动不会写回 `chamber.toml`。修改 TOML 配置仍需重启服务。
 
-## 5. Cron 时间
+## 5. HTTP 反向代理字段
+
+`[proxyhttp]` 或每个 `[[proxyhttp]]` 项包含以下字段：
+
+| 字段 | 类型 | 规范 |
+| --- | --- | --- |
+| `working_directory` | 字符串 | 可选；脚本运行目录。相对路径以 `chamber.toml` 所在目录为基准；默认 `"."`。目录必须存在。 |
+| `script` | 字符串 | 必填；由平台 shell 执行的启动命令文本。服务应以前台进程运行。 |
+| `upstream` | 字符串 | 必填；HTTP upstream URL，例如 `http://127.0.0.1:3000`。当前只支持明文 HTTP，不支持 HTTPS。可包含基础路径。 |
+| `route` | 字符串 | 必填；应用接收请求的 URL 前缀。规范化后的 route 必须与所有 `staticweb` 和 `proxyhttp` route 唯一。 |
+
+应用启动时会在 `working_directory` 中启动 `script`，并把匹配 route 的请求转发到 upstream。转发时会剥离 route 前缀并保留查询串；例如 `/api-proxy/items?id=1` 会转发为 upstream 的 `/items?id=1`。若 upstream URL 含基础路径，则该路径会保留在转发目标中。常见请求头、请求体、响应状态码和响应头会被转发；连接相关头由代理重新生成。当前入站请求体上限为 16 KiB，代理响应会缓冲且上限为 64 MiB。服务启动期间 upstream 尚未就绪时，请求会得到 `502 Bad Gateway`，连接超时会得到 `504 Gateway Timeout`。
+
+`script` 按受信任的本地 shell 命令处理，应让服务以前台进程运行。注销代理 route 时会终止该启动命令的进程组；已有请求完成后再释放服务进程。`App::global()` 的 `register_proxy_http(working_directory, script, route, upstream)` 和 `unregister_proxy_http(route)` 也可在运行期间动态增加或移除代理。配置和脚本不得由不可信用户输入生成。
+
+## 6. Cron 时间
 
 规范只接受五段 Unix cron 表达式。调度使用服务器本地时区；版本 1 不支持单个 Job 指定时区。表达式在启动时校验，非法表达式会导致启动失败。
 
-## 6. 工作目录与命令
+## 7. 工作目录与命令
 
 相对 `working_directory` 从 Chamber 目录解析。例如 `"."` 表示包含 `chamber.toml` 的目录。`command` 由 `ShellRunner` 作为 shell 文本执行，因此可以使用管道、重定向和 shell 语法；命令配置必须来自可信任的本地文件，不应由不可信用户输入生成。
 
 `timeout` 是单次命令运行的墙钟上限。到达上限后，runner 会终止命令及其子进程，并记录超时。标准输出和标准错误会写入服务日志；非零退出码会记录，但不会自动暂停 Job。
 
-## 7. 启动与运行行为
+## 8. 启动与运行行为
 
 - 配置只在程序启动时加载。修改 TOML 后需要重启程序；版本 1 不定义热重载。
 - `JobService` 在进程内是全局单例；已加载的 Jobs 由 Chamber 持有共享引用。
@@ -108,6 +130,6 @@ route = "/assets"
 - 暂停/启动状态是运行时状态，不回写 TOML。重启后状态重新由 `enabled` 决定。
 - TOML 里的 `enabled = false` 会使 Job 保留在配置和列表中，但不执行定时命令。
 
-## 8. 校验失败
+## 9. 校验失败
 
-以下情况应报告包含 Chamber 路径及字段位置的错误，并终止启动：无法读取 TOML、版本不支持、Chamber 名称与目录名不一致、Job 名称重复或为空、字段缺失或类型错误、cron 无效、超时格式无效、工作目录不存在、静态目录不存在或不是目录、静态 route 无效或重复，或出现未知字段。
+以下情况应报告包含 Chamber 路径及字段位置的错误，并终止启动：无法读取 TOML、版本不支持、Chamber 名称与目录名不一致、Job 名称重复或为空、字段缺失或类型错误、cron 无效、超时格式无效、工作目录不存在、静态目录不存在或不是目录、静态 route 无效或重复、proxyhttp route 重复或无效、upstream URL 不是有效的 HTTP URL，或出现未知字段。

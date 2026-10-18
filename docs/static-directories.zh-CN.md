@@ -22,3 +22,15 @@ let removed = app.unregister_static_directory("/assets")?;
 - `..`、`.` 和反斜杠路径段会被拒绝。服务会解析文件的规范路径，并拒绝访问挂载目录之外的符号链接目标。
 - 根据文件扩展名设置常见的 `Content-Type`；无法识别的类型使用 `application/octet-stream`。
 - 目录或前缀无效时，`register_static_directory` 返回 `io::Error`；`unregister_static_directory` 返回是否成功移除。`App::global()` 返回默认服务器使用的共享实例，任意模块都可以通过该实例在运行期间修改挂载。
+
+## HTTP 反向代理
+
+可以通过同一个共享 `App` 在运行期间启动并挂载本地 HTTP 服务：
+
+```rust
+let app = app::App::global();
+app.register_proxy_http("./service", "./start.sh", "/service", "http://127.0.0.1:3000")?;
+let removed = app.unregister_proxy_http("/service")?;
+```
+
+`script` 是在 `working_directory` 中执行的 shell 命令文本，服务需以前台进程运行。匹配 route 后，代理会剥离该前缀并保留查询串，例如 `/service/users?page=2` 转发为 `/users?page=2`。upstream 目前只支持 `http://` URL。`staticweb` 和 `proxyhttp` 共享 URL 挂载表，规范化后的 route 不能重复；不同前缀重叠时，最长匹配前缀优先。移除代理挂载时会停止对应启动命令的进程组。
