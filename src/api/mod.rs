@@ -1,7 +1,6 @@
-use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -16,16 +15,41 @@ struct Credentials {
     password: String,
 }
 
-pub fn open_database() -> rusqlite::Result<Connection> {
-    fs::create_dir_all("data")
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let database = Connection::open("data/auth.sqlite3")?;
-    initialize_database(&database)?;
-    Ok(database)
-}
-
 pub fn is_api_path(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/")
+}
+
+pub fn cleanup_expired_sessions(database: &Connection) -> rusqlite::Result<()> {
+    database.execute(
+        "DELETE FROM sessions WHERE expires_at <= ?1",
+        params![unix_time()],
+    )?;
+    Ok(())
+}
+
+pub fn user_count(database: &Connection) -> rusqlite::Result<i64> {
+    database.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+}
+
+pub fn create_initial_account(
+    database: &mut Connection,
+) -> rusqlite::Result<Option<(String, String)>> {
+    let transaction = database.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let count: i64 = transaction.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+    if count > 0 {
+        transaction.commit()?;
+        return Ok(None);
+    }
+
+    let username = "admin".to_owned();
+    let password = initial_password();
+    let password_hash = password_auth::generate_hash(&password);
+    transaction.execute(
+        "INSERT INTO users (username, password_hash, created_at) VALUES (?1, ?2, ?3)",
+        params![username, password_hash, unix_time()],
+    )?;
+    transaction.commit()?;
+    Ok(Some((username, password)))
 }
 
 pub fn handle(request: &Request, database: &Connection) -> rusqlite::Result<Response> {
@@ -50,25 +74,6 @@ pub fn handle(request: &Request, database: &Connection) -> rusqlite::Result<Resp
             json!({"error": "API 端点不存在。"}),
         )),
     }
-}
-
-fn initialize_database(database: &Connection) -> rusqlite::Result<()> {
-    database.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         CREATE TABLE IF NOT EXISTS users (
-             id INTEGER PRIMARY KEY AUTOINCREMENT,
-             username TEXT NOT NULL UNIQUE,
-             password_hash TEXT NOT NULL,
-             created_at INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS sessions (
-             token TEXT PRIMARY KEY,
-             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-             expires_at INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
-         DELETE FROM sessions WHERE expires_at <= unixepoch();",
-    )
 }
 
 fn register(request: &Request, database: &Connection) -> rusqlite::Result<Response> {
@@ -236,4 +241,10 @@ fn unix_time() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn initial_password() -> String {
+    let bytes = *uuid::Uuid::new_v4().as_bytes();
+    let random_value = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    (random_value % 900_000 + 100_000).to_string()
 }

@@ -1,5 +1,6 @@
 /target
 /Output/
+/.env
 /ui/node_modules/
 /ui/dist/
 /data/*.sqlite3
