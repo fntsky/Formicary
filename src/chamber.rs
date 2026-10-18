@@ -27,12 +27,32 @@ impl Chamber {
         shell_command: impl Into<String>,
         timeout: Duration,
     ) -> Result<Job, JobServiceError> {
-        let job = self.job_service.create_job(
+        self.create_job_with_enabled(
             name,
             cron_expression,
             working_directory,
             shell_command,
             timeout,
+            true,
+        )
+    }
+
+    pub(crate) fn create_job_with_enabled(
+        &self,
+        name: impl Into<String>,
+        cron_expression: impl Into<String>,
+        working_directory: impl AsRef<Path>,
+        shell_command: impl Into<String>,
+        timeout: Duration,
+        enabled: bool,
+    ) -> Result<Job, JobServiceError> {
+        let job = self.job_service.create_job_with_enabled(
+            name,
+            cron_expression,
+            working_directory,
+            shell_command,
+            timeout,
+            enabled,
         )?;
         self.jobs
             .lock()

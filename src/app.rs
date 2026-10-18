@@ -9,17 +9,19 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use crate::http::{Request, Response};
-use crate::{api, http, migrations, ui};
+use crate::{api, chamber_manager::ChamberManager, http, migrations, ui};
 
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 53212;
 const DEFAULT_DATABASE_PATH: &str = "data/auth.sqlite3";
+const DEFAULT_CHAMBERS_DIR: &str = "./chamber";
 
 #[derive(Debug)]
 pub struct Config {
     pub host: String,
     pub port: u16,
     pub database_path: PathBuf,
+    pub chambers_dir: PathBuf,
 }
 
 pub fn load_config() -> io::Result<Config> {
@@ -42,15 +44,24 @@ pub fn load_config() -> io::Result<Config> {
         None => PathBuf::from(DEFAULT_DATABASE_PATH),
     };
 
+    let chambers_dir = match env::var_os("FORMICARY_CHAMBERS_DIR") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        Some(_) => return Err(invalid_config("FORMICARY_CHAMBERS_DIR cannot be empty")),
+        None => PathBuf::from(DEFAULT_CHAMBERS_DIR),
+    };
+
     Ok(Config {
         host,
         port,
         database_path,
+        chambers_dir,
     })
 }
 
 pub fn run() -> io::Result<()> {
     let config = load_config()?;
+    let chambers = ChamberManager::load(&config.chambers_dir)
+        .map_err(|error| io::Error::other(format!("could not load Chambers: {error}")))?;
     let mut database = initialize(&config)
         .map_err(|error| io::Error::other(format!("could not initialize application: {error}")))?;
 
@@ -79,7 +90,7 @@ pub fn run() -> io::Result<()> {
 
         match http::read_request(&stream) {
             Ok(Some(request)) => {
-                let response = handle_request(&request, &mut database);
+                let response = handle_request(&request, &mut database, &chambers);
                 http::write_response(&mut stream, &response, request.method == "HEAD")?;
             }
             Ok(None) => {}
@@ -123,9 +134,13 @@ pub fn initialize(config: &Config) -> Result<Connection, Box<dyn Error>> {
     Ok(database)
 }
 
-fn handle_request(request: &Request, database: &mut Connection) -> Response {
+fn handle_request(
+    request: &Request,
+    database: &mut Connection,
+    chambers: &ChamberManager,
+) -> Response {
     if api::is_api_path(&request.path) {
-        return match api::handle(request, database) {
+        return match api::handle(request, database, chambers) {
             Ok(response) => response,
             Err(error) => {
                 eprintln!("API database error: {error}");

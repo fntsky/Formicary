@@ -4,7 +4,10 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::chamber_manager::ChamberManager;
 use crate::http::{Request, Response};
+use crate::job::Job;
+use crate::job_service::JobServiceError;
 
 const SESSION_TTL_SECONDS: u64 = 60 * 60 * 24;
 const SESSION_COOKIE: &str = "formicary_session";
@@ -64,7 +67,11 @@ pub fn create_initial_account(
     Ok(Some((username, password)))
 }
 
-pub fn handle(request: &Request, database: &mut Connection) -> rusqlite::Result<Response> {
+pub fn handle(
+    request: &Request,
+    database: &mut Connection,
+    chambers: &ChamberManager,
+) -> rusqlite::Result<Response> {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/api") => Ok(Response::json(
             "200 OK",
@@ -75,7 +82,12 @@ pub fn handle(request: &Request, database: &mut Connection) -> rusqlite::Result<
                     "/api/me",
                     "/api/logout",
                     "/api/admin/username",
-                    "/api/admin/password"
+                    "/api/admin/password",
+                    "/api/chambers",
+                    "/api/chambers/{name}/jobs",
+                    "/api/jobs",
+                    "/api/jobs/{id}/pause",
+                    "/api/jobs/{id}/start"
                 ]
             }),
         )),
@@ -84,6 +96,14 @@ pub fn handle(request: &Request, database: &mut Connection) -> rusqlite::Result<
         ("POST", "/api/logout") => logout(request, database),
         ("POST", "/api/admin/username") => change_username(request, database),
         ("POST", "/api/admin/password") => change_password(request, database),
+        ("GET", "/api/chambers") => list_chambers(request, database, chambers),
+        ("GET", "/api/jobs") => list_jobs(request, database, chambers),
+        _ if request.path.starts_with("/api/chambers/") => {
+            chamber_jobs_route(request, database, chambers)
+        }
+        _ if request.path.starts_with("/api/jobs/") => {
+            job_action_route(request, database, chambers)
+        }
         (_, "/api/register") => Ok(Response::json(
             "410 Gone",
             json!({"error": "用户注册已停用，此服务只支持管理员账户。"}),
@@ -94,7 +114,9 @@ pub fn handle(request: &Request, database: &mut Connection) -> rusqlite::Result<
             | "/api/me"
             | "/api/logout"
             | "/api/admin/username"
-            | "/api/admin/password",
+            | "/api/admin/password"
+            | "/api/chambers"
+            | "/api/jobs",
         ) => Ok(Response::json(
             "405 Method Not Allowed",
             json!({"error": "请求方法不支持。"}),
@@ -104,6 +126,177 @@ pub fn handle(request: &Request, database: &mut Connection) -> rusqlite::Result<
             json!({"error": "API 端点不存在。"}),
         )),
     }
+}
+
+fn list_chambers(
+    request: &Request,
+    database: &Connection,
+    chambers: &ChamberManager,
+) -> rusqlite::Result<Response> {
+    if authenticated_user_id(request, database)?.is_none() {
+        return Ok(unauthorized_response());
+    }
+
+    let summaries = chambers
+        .summaries()
+        .into_iter()
+        .map(|chamber| json!({"name": chamber.name, "job_count": chamber.job_count}))
+        .collect::<Vec<_>>();
+    Ok(Response::json("200 OK", json!({"chambers": summaries})))
+}
+
+fn list_jobs(
+    request: &Request,
+    database: &Connection,
+    chambers: &ChamberManager,
+) -> rusqlite::Result<Response> {
+    if authenticated_user_id(request, database)?.is_none() {
+        return Ok(unauthorized_response());
+    }
+
+    let jobs = chambers
+        .list_jobs()
+        .into_iter()
+        .map(|(chamber, job)| job_json(&chamber, &job))
+        .collect::<Vec<_>>();
+    Ok(Response::json("200 OK", json!({"jobs": jobs})))
+}
+
+fn chamber_jobs_route(
+    request: &Request,
+    database: &Connection,
+    chambers: &ChamberManager,
+) -> rusqlite::Result<Response> {
+    let segments = request.path.split('/').collect::<Vec<_>>();
+    let ["", "api", "chambers", encoded_name, "jobs"] = segments.as_slice() else {
+        return Ok(not_found_response());
+    };
+    if request.method != "GET" {
+        return Ok(method_not_allowed_response());
+    }
+    if authenticated_user_id(request, database)?.is_none() {
+        return Ok(unauthorized_response());
+    }
+
+    let Some(name) = decode_path_segment(encoded_name) else {
+        return Ok(Response::json(
+            "400 Bad Request",
+            json!({"error": "Chamber 名称编码无效。"}),
+        ));
+    };
+    let Some(jobs) = chambers.jobs_for_chamber(&name) else {
+        return Ok(not_found_response());
+    };
+    let jobs = jobs
+        .iter()
+        .map(|job| job_json(&name, job))
+        .collect::<Vec<_>>();
+    Ok(Response::json(
+        "200 OK",
+        json!({"chamber": name, "jobs": jobs}),
+    ))
+}
+
+fn job_action_route(
+    request: &Request,
+    database: &Connection,
+    chambers: &ChamberManager,
+) -> rusqlite::Result<Response> {
+    let segments = request.path.split('/').collect::<Vec<_>>();
+    let ["", "api", "jobs", raw_id, action] = segments.as_slice() else {
+        return Ok(not_found_response());
+    };
+    if !matches!(*action, "pause" | "start") {
+        return Ok(not_found_response());
+    }
+    if request.method != "POST" {
+        return Ok(method_not_allowed_response());
+    }
+    if authenticated_user_id(request, database)?.is_none() {
+        return Ok(unauthorized_response());
+    }
+    let Ok(id) = raw_id.parse::<u64>() else {
+        return Ok(not_found_response());
+    };
+    let Some((chamber, _)) = chambers
+        .list_jobs()
+        .into_iter()
+        .find(|(_, candidate)| candidate.id() == id)
+    else {
+        return Ok(not_found_response());
+    };
+
+    let result = if *action == "pause" {
+        chambers.pause_job(id)
+    } else {
+        chambers.start_job(id)
+    };
+    match result {
+        Ok(job) => Ok(Response::json(
+            "200 OK",
+            json!({"job": job_json(&chamber, &job)}),
+        )),
+        Err(JobServiceError::NotFound(_)) => Ok(not_found_response()),
+        Err(error) => {
+            eprintln!("Could not change job {id} state: {error}");
+            Ok(Response::json(
+                "500 Internal Server Error",
+                json!({"error": "无法更新 Job 状态。"}),
+            ))
+        }
+    }
+}
+
+fn job_json(chamber: &str, job: &Job) -> serde_json::Value {
+    let snapshot = job.snapshot();
+    json!({
+        "id": snapshot.id,
+        "chamber": chamber,
+        "name": snapshot.name,
+        "cron": snapshot.cron_expression,
+        "working_directory": snapshot.working_directory,
+        "command": snapshot.shell_command,
+        "timeout_ms": snapshot.timeout.as_millis(),
+        "enabled": snapshot.enabled,
+    })
+}
+
+fn decode_path_segment(segment: &str) -> Option<String> {
+    let source = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(source.len());
+    let mut index = 0;
+    while index < source.len() {
+        if source[index] == b'%' {
+            let high = *source.get(index + 1)?;
+            let low = *source.get(index + 2)?;
+            decoded.push((hex_digit(high)? << 4) | hex_digit(low)?);
+            index += 3;
+        } else {
+            decoded.push(source[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn not_found_response() -> Response {
+    Response::json("404 Not Found", json!({"error": "API 端点不存在。"}))
+}
+
+fn method_not_allowed_response() -> Response {
+    Response::json(
+        "405 Method Not Allowed",
+        json!({"error": "请求方法不支持。"}),
+    )
 }
 
 fn login(request: &Request, database: &Connection) -> rusqlite::Result<Response> {

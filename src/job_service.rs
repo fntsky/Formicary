@@ -92,6 +92,25 @@ impl JobService {
         shell_command: impl Into<String>,
         timeout: Duration,
     ) -> Result<Job, JobServiceError> {
+        self.create_job_with_enabled(
+            name,
+            cron_expression,
+            working_directory,
+            shell_command,
+            timeout,
+            true,
+        )
+    }
+
+    pub(crate) fn create_job_with_enabled(
+        &self,
+        name: impl Into<String>,
+        cron_expression: impl Into<String>,
+        working_directory: impl AsRef<Path>,
+        shell_command: impl Into<String>,
+        timeout: Duration,
+        enabled: bool,
+    ) -> Result<Job, JobServiceError> {
         let cron_expression = cron_expression.into();
         let schedule = parse_schedule(&cron_expression)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -102,7 +121,7 @@ impl JobService {
             working_directory: working_directory.as_ref().to_path_buf(),
             shell_command: shell_command.into(),
             timeout,
-            enabled: true,
+            enabled,
         });
         let control = Arc::new((
             Mutex::new(JobState {
@@ -248,6 +267,10 @@ fn parse_schedule(expression: &str) -> Result<Schedule, JobServiceError> {
         _ => expression.to_owned(),
     };
     Schedule::from_str(&normalized).map_err(|_| JobServiceError::InvalidCron(expression.into()))
+}
+
+pub(crate) fn validate_cron_expression(expression: &str) -> Result<(), JobServiceError> {
+    parse_schedule(expression).map(|_| ())
 }
 
 fn run_job(control: JobControl) {
