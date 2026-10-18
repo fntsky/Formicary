@@ -12,8 +12,8 @@ use std::time::Duration;
 use chrono::{DateTime, Local};
 use cron::Schedule;
 
-use crate::job::{Job, JobSnapshot};
-use crate::shell_runner::{ShellRunner, ShellRunnerError};
+use crate::service::job::{Job, JobSnapshot};
+use crate::service::shell_runner::{ShellRunner, ShellRunnerError};
 
 static GLOBAL_JOB_SERVICE: OnceLock<JobService> = OnceLock::new();
 

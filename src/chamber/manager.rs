@@ -8,8 +8,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::chamber::Chamber;
-use crate::job::Job;
-use crate::job_service::{JobServiceError, validate_cron_expression};
+use crate::service::job::Job;
+use crate::service::job_service::{JobServiceError, validate_cron_expression};
 
 const MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1000;
 
@@ -386,5 +386,5 @@ fn validation_error(path: impl AsRef<Path>, message: impl fmt::Display) -> Chamb
 }
 
 #[cfg(test)]
-#[path = "tests/chamber_manager_tests.rs"]
+#[path = "tests/manager.rs"]
 mod tests;

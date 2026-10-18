@@ -2,8 +2,11 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::job::Job;
-use crate::job_service::{JobService, JobServiceError};
+use crate::service::job::Job;
+use crate::service::job_service::{JobService, JobServiceError};
+
+pub mod manager;
+pub use manager::ChamberManager;
 
 /// A chamber references the global job service and keeps handles to its jobs.
 pub struct Chamber {

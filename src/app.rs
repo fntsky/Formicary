@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use crate::http::{Request, Response};
-use crate::{api, chamber_manager::ChamberManager, http, migrations, ui};
+use crate::{api, chamber::ChamberManager, http, migrations, ui};
 
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 53212;
