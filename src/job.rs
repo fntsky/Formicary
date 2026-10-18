@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// A shared handle to a scheduled shell job.
 ///
@@ -19,6 +20,7 @@ pub struct JobSnapshot {
     pub cron_expression: String,
     pub working_directory: PathBuf,
     pub shell_command: String,
+    pub timeout: Duration,
     pub enabled: bool,
 }
 
@@ -43,12 +45,14 @@ impl Job {
         cron_expression: String,
         working_directory: PathBuf,
         shell_command: String,
+        timeout: Duration,
     ) {
         let mut snapshot = self.inner.write().expect("job lock poisoned");
         snapshot.name = name;
         snapshot.cron_expression = cron_expression;
         snapshot.working_directory = working_directory;
         snapshot.shell_command = shell_command;
+        snapshot.timeout = timeout;
     }
 
     pub(crate) fn set_enabled(&self, enabled: bool) {

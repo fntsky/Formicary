@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::job::Job;
 use crate::job_service::{JobService, JobServiceError};
@@ -24,10 +25,15 @@ impl Chamber {
         cron_expression: impl Into<String>,
         working_directory: impl AsRef<Path>,
         shell_command: impl Into<String>,
+        timeout: Duration,
     ) -> Result<Job, JobServiceError> {
-        let job =
-            self.job_service
-                .create_job(name, cron_expression, working_directory, shell_command)?;
+        let job = self.job_service.create_job(
+            name,
+            cron_expression,
+            working_directory,
+            shell_command,
+            timeout,
+        )?;
         self.jobs
             .lock()
             .expect("chamber job list lock poisoned")

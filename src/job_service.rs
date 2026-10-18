@@ -13,7 +13,7 @@ use chrono::{DateTime, Local};
 use cron::Schedule;
 
 use crate::job::{Job, JobSnapshot};
-use crate::shell_runner::ShellRunner;
+use crate::shell_runner::{ShellRunner, ShellRunnerError};
 
 static GLOBAL_JOB_SERVICE: OnceLock<JobService> = OnceLock::new();
 
@@ -90,6 +90,7 @@ impl JobService {
         cron_expression: impl Into<String>,
         working_directory: impl AsRef<Path>,
         shell_command: impl Into<String>,
+        timeout: Duration,
     ) -> Result<Job, JobServiceError> {
         let cron_expression = cron_expression.into();
         let schedule = parse_schedule(&cron_expression)?;
@@ -100,6 +101,7 @@ impl JobService {
             cron_expression,
             working_directory: working_directory.as_ref().to_path_buf(),
             shell_command: shell_command.into(),
+            timeout,
             enabled: true,
         });
         let control = Arc::new((
@@ -143,6 +145,7 @@ impl JobService {
         cron_expression: impl Into<String>,
         working_directory: impl AsRef<Path>,
         shell_command: impl Into<String>,
+        timeout: Duration,
     ) -> Result<Job, JobServiceError> {
         let cron_expression = cron_expression.into();
         let schedule = parse_schedule(&cron_expression)?;
@@ -155,6 +158,7 @@ impl JobService {
             cron_expression,
             working_directory.as_ref().to_path_buf(),
             shell_command.into(),
+            timeout,
         );
         state.schedule = schedule;
         state.last_scheduled = None;
@@ -300,7 +304,7 @@ fn run_job(control: JobControl) {
 
 fn run_shell_job(job: &JobSnapshot) {
     println!("[job {}] running: {}", job.id, job.shell_command);
-    match ShellRunner::run(&job.working_directory, &job.shell_command) {
+    match ShellRunner::run_with_timeout(&job.working_directory, &job.shell_command, job.timeout) {
         Ok(output) => {
             if !output.stdout.is_empty() {
                 print!(
@@ -320,6 +324,11 @@ fn run_shell_job(job: &JobSnapshot) {
                 eprintln!("[job {}] exited with status {}", job.id, output.status);
             }
         }
-        Err(error) => eprintln!("[job {}] could not run: {error}", job.id),
+        Err(ShellRunnerError::TimedOut { timeout }) => {
+            eprintln!("[job {}] timed out after {timeout:?}", job.id)
+        }
+        Err(ShellRunnerError::Io(error)) => {
+            eprintln!("[job {}] could not run: {error}", job.id)
+        }
     }
 }
