@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::chamber::Chamber;
 use crate::service::job::Job;
@@ -16,6 +16,7 @@ const MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1000;
 /// Loads the configured Chambers and retains their runtime Job handles.
 pub struct ChamberManager {
     chambers: Vec<ManagedChamber>,
+    static_web_mounts: Vec<StaticWebMount>,
 }
 
 struct ManagedChamber {
@@ -28,6 +29,13 @@ struct ManagedChamber {
 pub struct ChamberSummary {
     pub name: String,
     pub job_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct StaticWebMount {
+    pub directory: PathBuf,
+    pub route: String,
+    pub config_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -47,6 +55,9 @@ struct ChamberFile {
     chamber: ChamberHeader,
     #[serde(default)]
     jobs: Vec<JobFile>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_staticweb")]
+    staticweb: Vec<StaticWebFile>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +77,30 @@ struct JobFile {
     working_directory: String,
     command: String,
     timeout: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticWebFile {
+    directory: String,
+    route: String,
+}
+
+fn deserialize_staticweb<'de, D>(deserializer: D) -> Result<Vec<StaticWebFile>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StaticWebEntries {
+        Multiple(Vec<StaticWebFile>),
+        Single(StaticWebFile),
+    }
+
+    Ok(match StaticWebEntries::deserialize(deserializer)? {
+        StaticWebEntries::Multiple(entries) => entries,
+        StaticWebEntries::Single(entry) => vec![entry],
+    })
 }
 
 struct PreparedJob {
@@ -99,6 +134,8 @@ impl ChamberManager {
         entries.sort_by_key(|entry| entry.file_name());
 
         let mut prepared = Vec::new();
+        let mut static_web_mounts = Vec::new();
+        let mut static_web_routes = HashSet::new();
         for entry in entries {
             let entry_type = entry.file_type().map_err(|error| {
                 manager_io_error(&entry.path(), "could not inspect directory entry", error)
@@ -161,6 +198,53 @@ impl ChamberManager {
                         config.chamber.schema_version
                     ),
                 ));
+            }
+
+            for static_web in config.staticweb {
+                let route =
+                    crate::app::normalize_static_prefix(&static_web.route).map_err(|error| {
+                        validation_error(
+                            &config_path,
+                            format!("staticweb route {:?}: {error}", static_web.route),
+                        )
+                    })?;
+                if !static_web_routes.insert(route.clone()) {
+                    return Err(validation_error(
+                        &config_path,
+                        format!("duplicate staticweb route {route:?}"),
+                    ));
+                }
+
+                let configured_directory = PathBuf::from(&static_web.directory);
+                let directory_path = if configured_directory.is_absolute() {
+                    configured_directory
+                } else {
+                    directory.join(configured_directory)
+                };
+                let static_directory = fs::canonicalize(&directory_path).map_err(|error| {
+                    validation_error(
+                        &config_path,
+                        format!(
+                            "staticweb route {route:?}: could not access directory {}: {error}",
+                            directory_path.display()
+                        ),
+                    )
+                })?;
+                if !static_directory.is_dir() {
+                    return Err(validation_error(
+                        &config_path,
+                        format!(
+                            "staticweb route {route:?}: directory is not a directory: {}",
+                            static_directory.display()
+                        ),
+                    ));
+                }
+
+                static_web_mounts.push(StaticWebMount {
+                    directory: static_directory,
+                    route,
+                    config_path: config_path.clone(),
+                });
             }
 
             let mut names = HashSet::new();
@@ -270,7 +354,14 @@ impl ChamberManager {
             });
         }
 
-        Ok(Self { chambers })
+        Ok(Self {
+            chambers,
+            static_web_mounts,
+        })
+    }
+
+    pub fn static_web_mounts(&self) -> &[StaticWebMount] {
+        &self.static_web_mounts
     }
 
     pub fn summaries(&self) -> Vec<ChamberSummary> {

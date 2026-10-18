@@ -55,7 +55,7 @@ fn not_found() -> Response {
     )
 }
 
-fn content_type(path: &Path) -> &'static str {
+pub(crate) fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "text/javascript; charset=utf-8",

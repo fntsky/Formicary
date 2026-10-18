@@ -1,6 +1,6 @@
 # Chamber 与 Job 配置规范
 
-状态：配置设计规范（启动加载器将按本规范实现）。
+本文档描述当前启动加载器使用的配置格式和运行行为。
 
 ## 1. 配置目录
 
@@ -51,6 +51,10 @@ cron = "0 8 * * 1-5"
 working_directory = "."
 command = "./scripts/health-report.sh"
 timeout = "30s"
+
+[staticweb]
+directory = "./public"
+route = "/assets"
 ```
 
 规则：
@@ -59,6 +63,7 @@ timeout = "30s"
 - `[[jobs]]` 可以出现多次，也可以不出现。`name` 在同一个 Chamber 内必须唯一且非空。
 - 每个 Job 必须提供 `name`、`cron`、`working_directory`、`command` 和 `timeout`。
 - `enabled` 可省略，省略时默认为 `true`；设为 `false` 时，Job 会被加载但以暂停状态启动。
+- `[staticweb]` 可省略，用于配置一个静态目录及其 URL route；需要多个挂载时使用重复的 `[[staticweb]]`。
 - 未识别的字段应视为配置错误，避免拼写错误导致配置被忽略。
 
 ## 3. Job 字段
@@ -72,17 +77,30 @@ timeout = "30s"
 | `command` | 字符串 | 必填；交给平台 shell 执行的命令文本。 |
 | `timeout` | 字符串 | 必填；正整数加单位，单位为 `ms`、`s`、`m` 或 `h`，范围大于 0 且不超过 24 小时。 |
 
-### Cron 时间
+## 4. 静态 Web 字段
+
+`[staticweb]` 或每个 `[[staticweb]]` 项包含以下字段：
+
+| 字段 | 类型 | 规范 |
+| --- | --- | --- |
+| `directory` | 字符串 | 必填；静态文件目录。相对路径以当前 `chamber.toml` 所在目录为基准；也可使用绝对路径。目录必须存在。 |
+| `route` | 字符串 | 必填；URL 挂载前缀，例如 `/assets`。可省略开头和结尾的 `/`。跨所有 Chamber 的规范化 route 必须唯一；`/api` 和 `/ui` 前缀保留给应用。 |
+
+启动时，Chamber 加载器解析并校验目录和 route，然后将其注册到应用的静态目录挂载表。访问 `/assets/logo.svg` 会读取 `directory/logo.svg`；访问挂载前缀或目录路径时会尝试返回该目录下的 `index.html`。只响应 `GET` 和 `HEAD`。重叠 route 按最长前缀优先匹配。目录越界路径及指向挂载目录外的符号链接不会被提供。
+
+挂载 route 在所有已加载的 Chamber 之间必须唯一。运行期间可通过共享的 `App` 句柄动态增加或注销挂载；这类运行时改动不会写回 `chamber.toml`。修改 TOML 配置仍需重启服务。
+
+## 5. Cron 时间
 
 规范只接受五段 Unix cron 表达式。调度使用服务器本地时区；版本 1 不支持单个 Job 指定时区。表达式在启动时校验，非法表达式会导致启动失败。
 
-### 工作目录与命令
+## 6. 工作目录与命令
 
 相对 `working_directory` 从 Chamber 目录解析。例如 `"."` 表示包含 `chamber.toml` 的目录。`command` 由 `ShellRunner` 作为 shell 文本执行，因此可以使用管道、重定向和 shell 语法；命令配置必须来自可信任的本地文件，不应由不可信用户输入生成。
 
 `timeout` 是单次命令运行的墙钟上限。到达上限后，runner 会终止命令及其子进程，并记录超时。标准输出和标准错误会写入服务日志；非零退出码会记录，但不会自动暂停 Job。
 
-## 4. 启动与运行行为
+## 7. 启动与运行行为
 
 - 配置只在程序启动时加载。修改 TOML 后需要重启程序；版本 1 不定义热重载。
 - `JobService` 在进程内是全局单例；已加载的 Jobs 由 Chamber 持有共享引用。
@@ -90,6 +108,6 @@ timeout = "30s"
 - 暂停/启动状态是运行时状态，不回写 TOML。重启后状态重新由 `enabled` 决定。
 - TOML 里的 `enabled = false` 会使 Job 保留在配置和列表中，但不执行定时命令。
 
-## 5. 校验失败
+## 8. 校验失败
 
-以下情况应报告包含 Chamber 路径及字段位置的错误，并终止启动：无法读取 TOML、版本不支持、Chamber 名称与目录名不一致、Job 名称重复或为空、字段缺失或类型错误、cron 无效、超时格式无效、工作目录不存在，或出现未知字段。
+以下情况应报告包含 Chamber 路径及字段位置的错误，并终止启动：无法读取 TOML、版本不支持、Chamber 名称与目录名不一致、Job 名称重复或为空、字段缺失或类型错误、cron 无效、超时格式无效、工作目录不存在、静态目录不存在或不是目录、静态 route 无效或重复，或出现未知字段。

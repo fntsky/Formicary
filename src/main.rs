@@ -1,5 +1,5 @@
 mod api;
-mod app;
+pub mod app;
 pub mod chamber;
 mod http;
 mod migrations;
