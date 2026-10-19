@@ -56,6 +56,49 @@ async function postJson(endpoint, payload) {
   })
 }
 
+const proxyLogsChamber = ref('')
+const proxyLogs = ref([])
+const proxyLogsRoute = ref('')
+const proxyLogsLoading = ref(false)
+const proxyLogsError = ref('')
+let proxyLogsRequestId = 0
+
+async function openProxyLogs(mount, index) {
+  const requestId = ++proxyLogsRequestId
+  proxyLogsChamber.value = selectedChamber.value
+  proxyLogsRoute.value = mount.route
+  proxyLogs.value = []
+  proxyLogsError.value = ''
+  proxyLogsLoading.value = true
+  activePage.value = 'proxy-logs'
+  try {
+    const data = await requestJson(`/api/chambers/${encodeURIComponent(selectedChamber.value)}/proxies/${index}/logs`, { cache: 'no-store' })
+    if (requestId !== proxyLogsRequestId) return
+    const decoders = { stdout: new TextDecoder(), stderr: new TextDecoder() }
+    const entries = data.entries.map((entry) => ({
+      ...entry,
+      text: decoders[entry.stream].decode(new Uint8Array(entry.bytes), { stream: true }),
+      time: new Date(entry.timestamp).toLocaleString('zh-CN', { hour12: false }),
+    }))
+    for (const stream of ['stdout', 'stderr']) {
+      const tail = decoders[stream].decode()
+      const last = entries.findLast((entry) => entry.stream === stream)
+      if (last) last.text += tail
+    }
+    proxyLogs.value = entries
+  } catch (error) {
+    if (requestId === proxyLogsRequestId) proxyLogsError.value = error.message
+  } finally {
+    if (requestId === proxyLogsRequestId) proxyLogsLoading.value = false
+  }
+}
+
+function closeProxyLogs() {
+  proxyLogsRequestId++
+  activePage.value = 'chambers'
+  chamberTab.value = 'mounts'
+}
+
 const importDialog = ref(null)
 const importButton = ref(null)
 const importStage = ref('')
@@ -330,7 +373,7 @@ onMounted(async () => {
       </a>
       <template v-if="currentUser">
         <nav class="topbar-nav" aria-label="管理页面">
-          <button :class="{ selected: activePage === 'chambers' }" @click="activePage = 'chambers'">服务管理</button>
+          <button :class="{ selected: activePage === 'chambers' || activePage === 'proxy-logs' }" @click="activePage = 'chambers'">服务管理</button>
           <button :class="{ selected: activePage === 'account' }" @click="activePage = 'account'">账户设置</button>
         </nav>
         <div class="topbar-user"><span class="user-avatar">{{ currentUser.slice(0, 1).toUpperCase() }}</span>{{ currentUser }}</div>
@@ -597,10 +640,11 @@ onMounted(async () => {
                 <section class="mount-group">
                   <div class="mount-group-heading"><span class="mount-type-icon proxy-mount-icon">⇄</span><div><h4>HTTP 代理</h4><p>转发到本地服务</p></div><span class="count-pill">{{ chamberDetails.proxy_http.length }}</span></div>
                   <div v-if="!chamberDetails.proxy_http.length" class="small-empty">没有 HTTP 代理挂载。</div>
-                  <div v-for="mount in chamberDetails.proxy_http" :key="mount.route" class="mount-card">
+                  <div v-for="(mount, index) in chamberDetails.proxy_http" :key="mount.route" class="mount-card">
                     <div class="mount-route-line"><span class="route-method proxy-method">PROXY</span><strong>{{ mount.route }}</strong></div>
                     <p><span>上游</span><code>{{ mount.upstream }}</code></p>
                     <p><span>工作目录</span><code>{{ mount.working_directory }}</code></p>
+                    <button type="button" class="inline-link" @click="openProxyLogs(mount, index)">查看日志</button>
                   </div>
                 </section>
               </div>
@@ -608,6 +652,28 @@ onMounted(async () => {
           </template>
         </section>
       </section>
+    </main>
+
+    <main v-else-if="activePage === 'proxy-logs'" class="dashboard-main proxy-logs-page">
+      <button type="button" class="inline-link proxy-logs-back" @click="closeProxyLogs">← 返回服务挂载</button>
+      <div class="dashboard-heading">
+        <div>
+          <p class="eyebrow">PROXY LOGS</p>
+          <h1>代理日志</h1>
+          <p class="dashboard-subtitle">{{ proxyLogsChamber }} <span aria-hidden="true">/</span> {{ proxyLogsRoute }} · 进入页面时的日志快照</p>
+        </div>
+        <span v-if="!proxyLogsLoading && !proxyLogsError" class="count-pill">{{ proxyLogs.length }} 条记录</span>
+      </div>
+      <p v-if="proxyLogsLoading" class="panel-empty" role="status">正在读取日志…</p>
+      <p v-else-if="proxyLogsError" class="dashboard-message error-message" role="alert">{{ proxyLogsError }}</p>
+      <p v-else-if="!proxyLogs.length" class="panel-empty">暂无日志输出。</p>
+      <div v-else class="proxy-log-output" tabindex="0" aria-label="代理日志内容">
+        <div v-for="(entry, index) in proxyLogs" :key="index" class="proxy-log-entry" :class="{ 'proxy-log-error': entry.stream === 'stderr' }">
+          <span class="proxy-log-stream">{{ entry.stream }}</span>
+          <pre>{{ entry.text }}</pre>
+          <time class="proxy-log-time" :datetime="entry.timestamp">{{ entry.time }}</time>
+        </div>
+      </div>
     </main>
 
     <main v-else class="dashboard-main account-main">

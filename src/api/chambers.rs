@@ -57,7 +57,7 @@ pub(super) fn handle(
         ("GET", "/api/chambers") => list_chambers(request, database, chambers),
         ("GET", "/api/jobs") => list_jobs(request, database, chambers),
         _ if request.path.starts_with("/api/chambers/") => {
-            chamber_route(request, database, chambers)
+            chamber_route(request, database, chambers, app)
         }
         _ if request.path.starts_with("/api/jobs/") => {
             job_action_route(request, database, chambers)
@@ -115,9 +115,64 @@ fn chamber_route(
     request: &Request,
     database: &Connection,
     chambers: &ChamberManager,
+    app: &crate::app::App,
 ) -> rusqlite::Result<Response> {
     let segments = request.path.split('/').collect::<Vec<_>>();
     match segments.as_slice() {
+        [
+            "",
+            "api",
+            "chambers",
+            encoded_name,
+            "proxies",
+            raw_index,
+            "logs",
+        ] => {
+            if request.method != "GET" {
+                return Ok(method_not_allowed_response());
+            }
+            if authenticated_user_id(request, database)?.is_none() {
+                return Ok(unauthorized_response());
+            }
+            let Some(name) = decode_path_segment(encoded_name) else {
+                return Ok(invalid_chamber_name_response());
+            };
+            let Some(chamber) = chambers.chambers().iter().find(|item| item.name == name) else {
+                return Ok(not_found_response());
+            };
+            let Some(config) = raw_index
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| chamber.proxy_http_mounts().get(index))
+            else {
+                return Ok(not_found_response());
+            };
+            let proxy = match app.proxy_http_mount(&config.route) {
+                Ok(Some(proxy)) => proxy,
+                Ok(None) => return Ok(not_found_response()),
+                Err(_) => {
+                    return Ok(Response::json(
+                        "500 Internal Server Error",
+                        json!({"error": "无法读取代理日志。"}),
+                    ));
+                }
+            };
+            let entries = proxy
+                .logs()
+                .into_iter()
+                .map(|entry| {
+                    let timestamp: chrono::DateTime<chrono::Utc> = entry.timestamp.into();
+                    json!({"timestamp": timestamp.to_rfc3339(), "stream": match entry.stream {
+                    crate::service::shell_runner::ShellLogStream::Stdout => "stdout",
+                    crate::service::shell_runner::ShellLogStream::Stderr => "stderr",
+                }, "bytes": entry.bytes})
+                })
+                .collect::<Vec<_>>();
+            let mut response =
+                Response::json("200 OK", json!({"route": config.route, "entries": entries}));
+            response.headers.push("Cache-Control: no-store".into());
+            Ok(response)
+        }
         ["", "api", "chambers", encoded_name] => {
             if request.method != "GET" {
                 return Ok(method_not_allowed_response());
@@ -314,4 +369,102 @@ fn method_not_allowed_response() -> Response {
         "405 Method Not Allowed",
         json!({"error": "请求方法不支持。"}),
     )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{
+        collections::HashMap,
+        fs, thread,
+        time::{Duration, Instant},
+    };
+
+    /// 验证代理日志接口需要登录，返回带时间戳的输出快照，并拒绝不存在的代理。
+    /// Verifies that proxy log snapshots require authentication, contain timestamped output, and reject missing proxies.
+    #[test]
+    fn reads_authenticated_proxy_log_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("formicary-proxy-logs-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("test")).unwrap();
+        fs::write(root.join("test/chamber.toml"), "[chamber]\nname = 'test'\nschema_version = 1\n[proxyhttp]\nscript = 'printf hello'\nroute = '/logs-test'\nupstream = 'http://127.0.0.1:1'\n").unwrap();
+        let manager = ChamberManager::load(&root).unwrap();
+        let app = crate::app::App::new();
+        app.register_proxy_http(
+            root.join("test"),
+            "printf hello; printf error >&2",
+            "/logs-test",
+            "http://127.0.0.1:1",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app
+            .proxy_http_mount("/logs-test")
+            .unwrap()
+            .unwrap()
+            .shell()
+            .is_finished()
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let database = Connection::open_in_memory().unwrap();
+        database.execute_batch("CREATE TABLE sessions(token TEXT, user_id INTEGER, expires_at INTEGER); INSERT INTO sessions VALUES ('test-token', 1, 9999999999);").unwrap();
+        let mut request = Request {
+            method: "GET".into(),
+            target: "/api/chambers/test/proxies/0/logs".into(),
+            path: "/api/chambers/test/proxies/0/logs".into(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        assert_eq!(
+            chamber_route(&request, &database, &manager, &app)
+                .unwrap()
+                .status,
+            "401 Unauthorized"
+        );
+        request
+            .headers
+            .insert("cookie".into(), "formicary_session=test-token".into());
+        let response = chamber_route(&request, &database, &manager, &app).unwrap();
+        assert_eq!(response.status, "200 OK");
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|header| header == "Cache-Control: no-store")
+        );
+        let data: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(data["route"], "/logs-test");
+        let entries = data["entries"].as_array().unwrap();
+        assert!(entries.iter().all(|entry| {
+            chrono::DateTime::parse_from_rfc3339(entry["timestamp"].as_str().unwrap()).is_ok()
+        }));
+        for (stream, expected) in [
+            ("stdout", b"hello".as_slice()),
+            ("stderr", b"error".as_slice()),
+        ] {
+            let bytes: Vec<u8> = entries
+                .iter()
+                .filter(|entry| entry["stream"] == stream)
+                .flat_map(|entry| {
+                    entry["bytes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|byte| byte.as_u64().unwrap() as u8)
+                })
+                .collect();
+            assert_eq!(bytes, expected);
+        }
+        request.path = "/api/chambers/test/proxies/1/logs".into();
+        assert_eq!(
+            chamber_route(&request, &database, &manager, &app)
+                .unwrap()
+                .status,
+            "404 Not Found"
+        );
+        app.unregister_proxy_http("/logs-test").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }

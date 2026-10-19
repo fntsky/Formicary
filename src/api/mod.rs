@@ -87,6 +87,7 @@ pub fn handle(
                     "/api/chambers",
                     "/api/chambers/{name}",
                     "/api/chambers/{name}/jobs",
+                    "/api/chambers/{name}/proxies/{index}/logs",
                     "/api/jobs",
                     "/api/jobs/{id}/pause",
                     "/api/jobs/{id}/start"

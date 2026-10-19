@@ -150,6 +150,18 @@ impl App {
         Ok(())
     }
 
+    pub(crate) fn proxy_http_mount(&self, route: &str) -> io::Result<Option<ProxyMount>> {
+        let mounts = self
+            .mounts
+            .read()
+            .map_err(|_| io::Error::other("mount registry is unavailable"))?;
+        Ok(mounts
+            .proxy_http
+            .iter()
+            .find(|mount| mount.route == route)
+            .cloned())
+    }
+
     /// Unmounts a proxy route and stops its configured service process.
     pub fn unregister_proxy_http(&self, route: impl AsRef<str>) -> io::Result<bool> {
         let route = normalize_route_prefix(route.as_ref())?;
