@@ -1,0 +1,9 @@
+[chamber]
+name = "rs_blog"
+schema_version = 1
+
+[proxyhttp]
+working_directory = "../../../rs_blog"
+script = "BLOG_HOST=127.0.0.1 BLOG_PORT=53213 cargo run --release"
+upstream = "http://127.0.0.1:53213"
+route = "/blog"

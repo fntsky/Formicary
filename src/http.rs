@@ -4,7 +4,7 @@ use std::net::TcpStream;
 
 use serde_json::Value;
 
-const MAX_REQUEST_BODY: usize = 16 * 1024;
+const MAX_REQUEST_BODY: usize = 2 * 1024 * 1024;
 
 pub struct Request {
     pub method: String,

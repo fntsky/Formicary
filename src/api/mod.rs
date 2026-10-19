@@ -446,6 +446,24 @@ fn authenticated_user_id(
         .optional()
 }
 
+/// Returns the authenticated Formicary username for an incoming request.
+/// Proxy mounts use this to pass a verified identity to trusted local modules.
+pub fn authenticated_username(
+    request: &Request,
+    database: &Connection,
+) -> rusqlite::Result<Option<String>> {
+    let Some(user_id) = authenticated_user_id(request, database)? else {
+        return Ok(None);
+    };
+    database
+        .query_row(
+            "SELECT username FROM users WHERE id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
 fn verify_current_password(
     database: &Connection,
     user_id: i64,

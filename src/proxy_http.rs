@@ -69,8 +69,8 @@ impl ProxyMount {
                 .is_some_and(|suffix| suffix.starts_with('/'))
     }
 
-    pub(crate) fn forward(&self, request: &Request) -> Response {
-        match self.try_forward(request) {
+    pub(crate) fn forward(&self, request: &Request, authenticated_username: Option<&str>) -> Response {
+        match self.try_forward(request, authenticated_username) {
             Ok(response) => response,
             Err(error) => {
                 let (status, message) = if matches!(
@@ -94,7 +94,7 @@ impl ProxyMount {
         }
     }
 
-    fn try_forward(&self, request: &Request) -> io::Result<Response> {
+    fn try_forward(&self, request: &Request, authenticated_username: Option<&str>) -> io::Result<Response> {
         if self
             .process
             .child
@@ -122,9 +122,13 @@ impl ProxyMount {
             self.upstream.authority,
             request.body.len()
         )?;
+        if let Some(username) = authenticated_username.filter(|value| !value.contains(['\r', '\n'])) {
+            write!(stream, "X-Formicary-User: {username}\r\n")?;
+        }
         let connection_headers = connection_header_tokens(&request.headers);
         for (name, value) in &request.headers {
-            if is_hop_by_hop(name)
+            if name == "x-formicary-user"
+                || is_hop_by_hop(name)
                 || connection_headers.contains(name)
                 || !valid_header_value(value)
             {

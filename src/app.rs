@@ -384,7 +384,19 @@ fn handle_request(
     };
     if let Some(route) = route {
         return match route {
-            Route::Proxy(mount) => mount.forward(request),
+            Route::Proxy(mount) => {
+                let username = match api::authenticated_username(request, database) {
+                    Ok(username) => username,
+                    Err(error) => {
+                        eprintln!("Could not validate proxy request session: {error}");
+                        return Response::json(
+                            "500 Internal Server Error",
+                            json!({"error": "服务器内部错误。"}),
+                        );
+                    }
+                };
+                mount.forward(request, username.as_deref())
+            }
             Route::Static(mount) if request.method == "GET" || request.method == "HEAD" => {
                 let relative_path = request
                     .path
