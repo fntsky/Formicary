@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::service::shell_runner::{ShellExecution, ShellInput, ShellLogs};
 
@@ -13,6 +13,7 @@ use crate::service::shell_runner::{ShellExecution, ShellInput, ShellLogs};
 pub struct Job {
     pub(crate) inner: Arc<RwLock<JobSnapshot>>,
     pub(crate) execution: Arc<Mutex<Option<ShellExecution>>>,
+    pub(crate) history: Arc<Mutex<Vec<JobRunLog>>>,
 }
 
 /// A read-only copy of a job's current configuration and state.
@@ -27,21 +28,50 @@ pub struct JobSnapshot {
     pub enabled: bool,
 }
 
+/// Archived output and outcome of one completed Job invocation.
+#[derive(Clone, Debug)]
+pub struct JobRunLog {
+    pub started_at: SystemTime,
+    pub finished_at: SystemTime,
+    pub command: String,
+    pub working_directory: PathBuf,
+    pub logs: ShellLogs,
+    pub outcome: JobRunOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobRunOutcome {
+    Exited { success: bool, code: Option<i32> },
+    Terminated,
+    TimedOut,
+    Failed { error: String },
+}
+
 impl Job {
     pub(crate) fn new(snapshot: JobSnapshot) -> Self {
         Self {
             inner: Arc::new(RwLock::new(snapshot)),
             execution: Arc::new(Mutex::new(None)),
+            history: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Live output of the current run, or retained output of its most recent run.
+    /// Live output of the current run; completed runs are available in log_history().
     pub fn shell_logs(&self) -> Option<ShellLogs> {
         self.execution
             .lock()
             .expect("job execution lock poisoned")
             .as_ref()
             .map(ShellExecution::logs)
+    }
+
+    /// Completed runs in execution order, shared by all clones of this Job.
+    /// History is kept in memory for the lifetime of the Job.
+    pub fn log_history(&self) -> Vec<JobRunLog> {
+        self.history
+            .lock()
+            .expect("job history lock poisoned")
+            .clone()
     }
 
     pub fn shell_is_running(&self) -> bool {

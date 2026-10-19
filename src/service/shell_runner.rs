@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug)]
 pub enum ShellRunnerError {
@@ -64,6 +64,22 @@ impl ShellControl {
 pub struct ShellLogs {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// Output chunks in capture order; each chunk may contain partial or multiple lines.
+    pub entries: Vec<ShellLogEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShellLogEntry {
+    /// Time this output chunk was captured, independent of the display timezone.
+    pub timestamp: SystemTime,
+    pub stream: ShellLogStream,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellLogStream {
+    Stdout,
+    Stderr,
 }
 
 /// Cloneable input handle for sending bytes or commands to a running shell.
@@ -317,6 +333,15 @@ fn read_pipe<R: Read + Send + 'static>(
                 &mut logs.stdout
             };
             stream.extend_from_slice(&buffer[..count]);
+            logs.entries.push(ShellLogEntry {
+                timestamp: SystemTime::now(),
+                stream: if stderr {
+                    ShellLogStream::Stderr
+                } else {
+                    ShellLogStream::Stdout
+                },
+                bytes: buffer[..count].to_vec(),
+            });
         }
         Ok(output)
     })
@@ -432,6 +457,41 @@ mod tests {
     #[test]
     fn synchronous_runner_supplies_eof() {
         assert!(ShellRunner::run(".", "cat").unwrap().stdout.is_empty());
+    }
+
+    /// 验证每段输出记录捕获时间和来源，且合并后与原始输出一致。
+    /// Verifies that every output chunk records its capture time and stream and reconstructs the original output.
+    #[test]
+    fn timestamps_captured_output_chunks() {
+        let started_at = SystemTime::now();
+        let mut execution = ShellRunner::start(
+            ".",
+            "printf hello; printf error >&2",
+            Some(Duration::from_secs(3)),
+            ShellControl::default(),
+        )
+        .unwrap();
+        execution.finish().unwrap();
+        let finished_at = SystemTime::now();
+        let logs = execution.logs();
+        assert!(!logs.entries.is_empty());
+        assert!(
+            logs.entries
+                .iter()
+                .all(|entry| entry.timestamp >= started_at && entry.timestamp <= finished_at)
+        );
+        for (stream, expected) in [
+            (ShellLogStream::Stdout, &logs.stdout),
+            (ShellLogStream::Stderr, &logs.stderr),
+        ] {
+            let bytes: Vec<u8> = logs
+                .entries
+                .iter()
+                .filter(|entry| entry.stream == stream)
+                .flat_map(|entry| entry.bytes.iter().copied())
+                .collect();
+            assert_eq!(&bytes, expected);
+        }
     }
 
     /// 验证同步执行接口保留标准输出、错误输出及非零退出码。

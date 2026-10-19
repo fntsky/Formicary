@@ -7,12 +7,12 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local};
 use cron::Schedule;
 
-use crate::service::job::{Job, JobSnapshot};
+use crate::service::job::{Job, JobRunLog, JobRunOutcome, JobSnapshot};
 use crate::service::shell_runner::{ShellControl, ShellRunner, ShellRunnerError};
 
 static GLOBAL_JOB_SERVICE: OnceLock<JobService> = OnceLock::new();
@@ -327,15 +327,31 @@ fn run_job(control: JobControl) {
 
 fn run_shell_job(handle: &Job) {
     let job = handle.snapshot();
+    let started_at = SystemTime::now();
+    let control = ShellControl::default();
     println!("[job {}] running: {}", job.id, job.shell_command);
     let execution = match ShellRunner::start(
         &job.working_directory,
         &job.shell_command,
         Some(job.timeout),
-        ShellControl::default(),
+        control.clone(),
     ) {
         Ok(execution) => execution,
         Err(error) => {
+            handle
+                .history
+                .lock()
+                .expect("job history lock poisoned")
+                .push(JobRunLog {
+                    started_at,
+                    finished_at: SystemTime::now(),
+                    command: job.shell_command.clone(),
+                    working_directory: job.working_directory.clone(),
+                    logs: Default::default(),
+                    outcome: JobRunOutcome::Failed {
+                        error: error.to_string(),
+                    },
+                });
             eprintln!("[job {}] could not run: {error}", job.id);
             return;
         }
@@ -344,22 +360,49 @@ fn run_shell_job(handle: &Job) {
         .execution
         .lock()
         .expect("job execution lock poisoned") = Some(execution);
-    let result = loop {
+    let (result, logs) = loop {
         {
-            let mut execution = handle
+            let mut slot = handle
                 .execution
                 .lock()
                 .expect("job execution lock poisoned");
-            let execution = execution
-                .as_mut()
-                .expect("running Job has a shell execution");
-            if execution.is_finished() {
+            if slot
+                .as_ref()
+                .expect("running Job has a shell execution")
+                .is_finished()
+            {
+                let mut execution = slot.take().unwrap();
                 execution.close_input();
-                break execution.finish();
+                let result = execution.finish();
+                let logs = execution.logs();
+                break (result, logs);
             }
         }
         thread::sleep(Duration::from_millis(10));
     };
+    let outcome = match &result {
+        Err(ShellRunnerError::TimedOut { .. }) => JobRunOutcome::TimedOut,
+        Err(error) => JobRunOutcome::Failed {
+            error: error.to_string(),
+        },
+        Ok(_) if control.is_terminated() => JobRunOutcome::Terminated,
+        Ok(output) => JobRunOutcome::Exited {
+            success: output.status.success(),
+            code: output.status.code(),
+        },
+    };
+    handle
+        .history
+        .lock()
+        .expect("job history lock poisoned")
+        .push(JobRunLog {
+            started_at,
+            finished_at: SystemTime::now(),
+            command: job.shell_command.clone(),
+            working_directory: job.working_directory.clone(),
+            logs,
+            outcome,
+        });
     match result {
         Ok(output) => {
             if !output.stdout.is_empty() {
@@ -431,7 +474,11 @@ mod tests {
         worker.join().unwrap();
         assert!(!job.shell_is_running());
         assert!(job.shell_input().is_none());
-        assert_eq!(job.shell_logs().unwrap().stdout, b"readyhello\n");
+        assert!(job.shell_logs().is_none());
+        assert!(job.execution.lock().unwrap().is_none());
+        let history = job.log_history();
+        assert_eq!(history[0].logs.stdout, b"readyhello\n");
+        assert_eq!(history[0].outcome, JobRunOutcome::Terminated);
         assert!(job.snapshot().enabled);
     }
 
@@ -445,6 +492,75 @@ mod tests {
         );
         run_shell_job(&job);
         assert!(!job.shell_is_running());
-        assert_eq!(job.shell_logs().unwrap().stdout, b"before-timeout");
+        assert!(job.shell_logs().is_none());
+        let history = job.log_history();
+        assert_eq!(history[0].logs.stdout, b"before-timeout");
+        assert_eq!(history[0].outcome, JobRunOutcome::TimedOut);
+    }
+
+    /// 验证多次执行的日志分别归档到对应 Job，保留退出码且不会被下一次运行覆盖。
+    /// Verifies that repeated runs archive separate logs on their Job without overwriting previous output or exit codes.
+    #[test]
+    fn archives_each_run_on_its_own_job() {
+        let job = shell_job("printf first", Duration::from_secs(3));
+        run_shell_job(&job);
+        job.update(
+            "controlled".into(),
+            "* * * * *".into(),
+            ".".into(),
+            "printf second; printf error >&2; exit 7".into(),
+            Duration::from_secs(3),
+        );
+        run_shell_job(&job);
+        let history = job.clone().log_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].logs.stdout, b"first");
+        assert!(!history[0].logs.entries.is_empty());
+        assert!(
+            history[0]
+                .logs
+                .entries
+                .iter()
+                .all(|entry| entry.timestamp >= history[0].started_at
+                    && entry.timestamp <= history[0].finished_at)
+        );
+        assert_eq!(
+            history[0].outcome,
+            JobRunOutcome::Exited {
+                success: true,
+                code: Some(0)
+            }
+        );
+        assert_eq!(history[1].logs.stdout, b"second");
+        assert_eq!(history[1].logs.stderr, b"error");
+        assert_eq!(
+            history[1].outcome,
+            JobRunOutcome::Exited {
+                success: false,
+                code: Some(7)
+            }
+        );
+        assert!(history.iter().all(|run| run.finished_at >= run.started_at));
+        assert!(job.execution.lock().unwrap().is_none());
+        assert!(
+            shell_job("true", Duration::from_secs(3))
+                .log_history()
+                .is_empty()
+        );
+    }
+
+    /// 验证启动失败也会归档错误记录，并且不会留下 shell 执行句柄。
+    /// Verifies that a startup failure is archived as an error without retaining a shell execution handle.
+    #[test]
+    fn archives_startup_failure() {
+        let job = shell_job("true", Duration::from_secs(3));
+        job.inner.write().unwrap().working_directory =
+            std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        run_shell_job(&job);
+        assert!(matches!(
+            job.log_history()[0].outcome,
+            JobRunOutcome::Failed { .. }
+        ));
+        assert!(job.execution.lock().unwrap().is_none());
     }
 }
