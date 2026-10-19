@@ -476,6 +476,75 @@ impl ChamberManager {
         })
     }
 
+    /// Registers a Chamber's mounts and adds it to the manager in name order.
+    /// On failure, rolls back new mounts and pauses the rejected Chamber's Jobs.
+    pub fn add_chamber(
+        &mut self,
+        chamber: Chamber,
+        app: &crate::app::App,
+    ) -> Result<(), ChamberManagerError> {
+        let mut static_routes = Vec::new();
+        let mut proxy_routes = Vec::new();
+        let result = (|| {
+            if chamber.name.trim().is_empty() {
+                return Err(ChamberManagerError("Chamber name must not be empty".into()));
+            }
+            if self
+                .chambers
+                .iter()
+                .any(|existing| existing.name == chamber.name)
+            {
+                return Err(ChamberManagerError(format!(
+                    "Chamber {:?} already exists",
+                    chamber.name
+                )));
+            }
+            for mount in chamber.static_web_mounts() {
+                app.register_static_directory(&mount.directory, &mount.route)
+                    .map_err(|error| {
+                        manager_io_error(
+                            &mount.config_path,
+                            "could not register staticweb mount",
+                            error,
+                        )
+                    })?;
+                static_routes.push(mount.route.clone());
+            }
+            for mount in chamber.proxy_http_mounts() {
+                app.register_proxy_http(
+                    &mount.working_directory,
+                    &mount.script,
+                    &mount.route,
+                    &mount.upstream,
+                )
+                .map_err(|error| {
+                    manager_io_error(
+                        &mount.config_path,
+                        "could not register proxyhttp mount",
+                        error,
+                    )
+                })?;
+                proxy_routes.push(mount.route.clone());
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for route in proxy_routes.iter().rev() {
+                let _ = app.unregister_proxy_http(route);
+            }
+            for route in static_routes.iter().rev() {
+                let _ = app.unregister_static_directory(route);
+            }
+            for job in chamber.jobs() {
+                let _ = chamber.pause_job(job.id());
+            }
+            return Err(error);
+        }
+        self.chambers.push(chamber);
+        self.chambers.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(())
+    }
+
     pub fn import_github(
         &mut self,
         download: &crate::chamber::github::Download,
@@ -509,38 +578,8 @@ impl ChamberManager {
             let mut imported =
                 Self::load_directory(&self.root, Some(&name)).map_err(|error| error.to_string())?;
             let chamber = imported.chambers.pop().ok_or("没有找到 Chamber 配置。")?;
-            let mut static_routes = Vec::new();
-            let mut proxy_routes = Vec::new();
-            let mounts = (|| -> std::io::Result<()> {
-                for mount in chamber.static_web_mounts() {
-                    app.register_static_directory(&mount.directory, &mount.route)?;
-                    static_routes.push(mount.route.clone());
-                }
-                for mount in chamber.proxy_http_mounts() {
-                    app.register_proxy_http(
-                        &mount.working_directory,
-                        &mount.script,
-                        &mount.route,
-                        &mount.upstream,
-                    )?;
-                    proxy_routes.push(mount.route.clone());
-                }
-                Ok(())
-            })();
-            if let Err(error) = mounts {
-                for route in proxy_routes {
-                    let _ = app.unregister_proxy_http(route);
-                }
-                for route in static_routes {
-                    let _ = app.unregister_static_directory(route);
-                }
-                for job in chamber.jobs() {
-                    let _ = chamber.pause_job(job.id());
-                }
-                return Err(format!("无法加载 Chamber 挂载：{error}"));
-            }
-            self.chambers.push(chamber);
-            self.chambers.sort_by(|a, b| a.name.cmp(&b.name));
+            self.add_chamber(chamber, app)
+                .map_err(|error| error.to_string())?;
             Ok(name)
         })();
         if result.is_err() {

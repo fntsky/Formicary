@@ -114,3 +114,59 @@ fn derives_import_directory_from_configuration_and_rejects_traversal() {
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn adds_chambers_in_name_order_and_rejects_duplicates() {
+    let app = crate::app::App::new();
+    let mut manager = super::ChamberManager {
+        chambers: Vec::new(),
+        root: std::path::PathBuf::from("."),
+    };
+    manager
+        .add_chamber(crate::chamber::Chamber::new("zebra"), &app)
+        .unwrap();
+    manager
+        .add_chamber(crate::chamber::Chamber::new("alpha"), &app)
+        .unwrap();
+    assert!(
+        manager
+            .add_chamber(crate::chamber::Chamber::new("alpha"), &app)
+            .is_err()
+    );
+    assert!(
+        manager
+            .add_chamber(crate::chamber::Chamber::new(" "), &app)
+            .is_err()
+    );
+    let names: Vec<_> = manager
+        .chambers()
+        .iter()
+        .map(|chamber| chamber.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["alpha", "zebra"]);
+}
+
+#[test]
+fn failed_add_rolls_back_only_new_mounts() {
+    let root = std::env::temp_dir().join(format!("formicary-add-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let app = crate::app::App::new();
+    app.register_static_directory(&root, "/existing").unwrap();
+    let mut manager = super::ChamberManager {
+        chambers: Vec::new(),
+        root: root.clone(),
+    };
+    let mut chamber = crate::chamber::Chamber::new("test");
+    for route in ["/new", "/existing"] {
+        chamber.static_web.push(crate::chamber::StaticWebMount {
+            directory: root.clone(),
+            route: route.into(),
+            config_path: root.join("chamber.toml"),
+        });
+    }
+    assert!(manager.add_chamber(chamber, &app).is_err());
+    assert!(manager.chambers().is_empty());
+    assert!(!app.unregister_static_directory("/new").unwrap());
+    assert!(app.unregister_static_directory("/existing").unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
