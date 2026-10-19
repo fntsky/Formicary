@@ -231,6 +231,8 @@ mod tests {
             depth: Some(1),
         }
     }
+    /// 验证远端引用能识别默认分支、保留含斜杠的分支名，并拒绝空分支列表。
+    /// Verifies that remote references identify the default branch, preserve branch names containing slashes, and reject an empty branch list.
     #[test]
     fn parses_remote_default_and_nested_branch_names() {
         let result = parse_branches("ref: refs/heads/main\tHEAD\nabc\tHEAD\nabc\trefs/heads/main\ndef\trefs/heads/feature/import\n").unwrap();
@@ -239,6 +241,8 @@ mod tests {
         assert!(parse_branches("").is_err());
     }
 
+    /// 验证支持的 GitHub 仓库地址会规范化为 HTTPS 克隆地址，并拒绝无效地址。
+    /// Verifies that supported GitHub repository formats normalize to HTTPS clone URLs and invalid addresses are rejected.
     #[test]
     fn normalizes_github_urls_and_rejects_other_hosts() {
         assert_eq!(
@@ -260,6 +264,8 @@ mod tests {
             assert!(download(value).validate().is_err());
         }
     }
+    /// 验证已有目标目录会被拒绝，且其中的文件保持不变。
+    /// Verifies that an existing destination is rejected and its files remain unchanged.
     #[test]
     fn preserves_existing_destination() {
         let root =
@@ -279,6 +285,8 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// 验证拒绝不安全的目录名和零下载深度，同时允许下载完整历史。
+    /// Verifies that unsafe directory names and zero depth are rejected while full-history downloads are allowed.
     #[test]
     fn rejects_unsafe_destinations_and_invalid_depth() {
         for directory in ["../outside", "/tmp/source", ".", "-source", "nested/path"] {

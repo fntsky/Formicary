@@ -13,7 +13,7 @@ use chrono::{DateTime, Local};
 use cron::Schedule;
 
 use crate::service::job::{Job, JobSnapshot};
-use crate::service::shell_runner::{ShellRunner, ShellRunnerError};
+use crate::service::shell_runner::{ShellControl, ShellRunner, ShellRunnerError};
 
 static GLOBAL_JOB_SERVICE: OnceLock<JobService> = OnceLock::new();
 
@@ -315,8 +315,8 @@ fn run_job(control: JobControl) {
         }
 
         state.last_scheduled = Some(next_run);
-        let job = state.job.snapshot();
-        if !job.enabled {
+        let job = state.job.clone();
+        if !job.snapshot().enabled {
             continue;
         }
         drop(state);
@@ -325,9 +325,42 @@ fn run_job(control: JobControl) {
     }
 }
 
-fn run_shell_job(job: &JobSnapshot) {
+fn run_shell_job(handle: &Job) {
+    let job = handle.snapshot();
     println!("[job {}] running: {}", job.id, job.shell_command);
-    match ShellRunner::run_with_timeout(&job.working_directory, &job.shell_command, job.timeout) {
+    let execution = match ShellRunner::start(
+        &job.working_directory,
+        &job.shell_command,
+        Some(job.timeout),
+        ShellControl::default(),
+    ) {
+        Ok(execution) => execution,
+        Err(error) => {
+            eprintln!("[job {}] could not run: {error}", job.id);
+            return;
+        }
+    };
+    *handle
+        .execution
+        .lock()
+        .expect("job execution lock poisoned") = Some(execution);
+    let result = loop {
+        {
+            let mut execution = handle
+                .execution
+                .lock()
+                .expect("job execution lock poisoned");
+            let execution = execution
+                .as_mut()
+                .expect("running Job has a shell execution");
+            if execution.is_finished() {
+                execution.close_input();
+                break execution.finish();
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    match result {
         Ok(output) => {
             if !output.stdout.is_empty() {
                 print!(
@@ -353,5 +386,65 @@ fn run_shell_job(job: &JobSnapshot) {
         Err(ShellRunnerError::Io(error)) => {
             eprintln!("[job {}] could not run: {error}", job.id)
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn shell_job(command: &str, timeout: Duration) -> Job {
+        Job::new(JobSnapshot {
+            id: 1,
+            name: "controlled".into(),
+            cron_expression: "* * * * *".into(),
+            working_directory: ".".into(),
+            shell_command: command.into(),
+            timeout,
+            enabled: true,
+        })
+    }
+
+    /// 验证克隆的 Job 句柄共享实时输入、日志及终止能力，并在执行后保留日志和启用状态。
+    /// Verifies that cloned Job handles share live shell input, logs, and termination while preserving logs and the enabled state afterward.
+    #[test]
+    fn job_retains_shell_for_live_input_logs_and_termination() {
+        let job = shell_job("printf ready; exec cat", Duration::from_secs(5));
+        let worker_job = job.clone();
+        let worker = thread::spawn(move || run_shell_job(&worker_job));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !job.shell_logs().is_some_and(|logs| logs.stdout == b"ready") {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(job.shell_is_running());
+        job.shell_input().unwrap().send_line("hello").unwrap();
+        while !job
+            .shell_logs()
+            .is_some_and(|logs| logs.stdout == b"readyhello\n")
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        job.terminate_shell();
+        worker.join().unwrap();
+        assert!(!job.shell_is_running());
+        assert!(job.shell_input().is_none());
+        assert_eq!(job.shell_logs().unwrap().stdout, b"readyhello\n");
+        assert!(job.snapshot().enabled);
+    }
+
+    /// 验证 shell 执行超时后，Job 仍保留已捕获的输出。
+    /// Verifies that a Job retains captured output after its shell execution times out.
+    #[test]
+    fn job_retains_logs_after_timeout() {
+        let job = shell_job(
+            "printf before-timeout; sleep 30",
+            Duration::from_millis(100),
+        );
+        run_shell_job(&job);
+        assert!(!job.shell_is_running());
+        assert_eq!(job.shell_logs().unwrap().stdout, b"before-timeout");
     }
 }
