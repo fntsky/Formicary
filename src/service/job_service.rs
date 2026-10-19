@@ -435,6 +435,18 @@ fn run_shell_job(handle: &Job) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::service::shell_runner::ShellLogStream;
+    fn output(
+        entries: &[crate::service::shell_runner::ShellLogEntry],
+        stream: crate::service::shell_runner::ShellLogStream,
+    ) -> Vec<u8> {
+        entries
+            .iter()
+            .filter(|entry| entry.stream == stream)
+            .flat_map(|entry| entry.bytes.iter().copied())
+            .collect()
+    }
+
     use std::time::Instant;
 
     fn shell_job(command: &str, timeout: Duration) -> Job {
@@ -457,7 +469,10 @@ mod tests {
         let worker_job = job.clone();
         let worker = thread::spawn(move || run_shell_job(&worker_job));
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !job.shell_logs().is_some_and(|logs| logs.stdout == b"ready") {
+        while !job
+            .shell_logs()
+            .is_some_and(|logs| output(&logs, ShellLogStream::Stdout) == b"ready")
+        {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
         }
@@ -465,7 +480,7 @@ mod tests {
         job.shell_input().unwrap().send_line("hello").unwrap();
         while !job
             .shell_logs()
-            .is_some_and(|logs| logs.stdout == b"readyhello\n")
+            .is_some_and(|logs| output(&logs, ShellLogStream::Stdout) == b"readyhello\n")
         {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
@@ -477,7 +492,10 @@ mod tests {
         assert!(job.shell_logs().is_none());
         assert!(job.execution.lock().unwrap().is_none());
         let history = job.log_history();
-        assert_eq!(history[0].logs.stdout, b"readyhello\n");
+        assert_eq!(
+            output(&history[0].logs, ShellLogStream::Stdout),
+            b"readyhello\n"
+        );
         assert_eq!(history[0].outcome, JobRunOutcome::Terminated);
         assert!(job.snapshot().enabled);
     }
@@ -494,7 +512,10 @@ mod tests {
         assert!(!job.shell_is_running());
         assert!(job.shell_logs().is_none());
         let history = job.log_history();
-        assert_eq!(history[0].logs.stdout, b"before-timeout");
+        assert_eq!(
+            output(&history[0].logs, ShellLogStream::Stdout),
+            b"before-timeout"
+        );
         assert_eq!(history[0].outcome, JobRunOutcome::TimedOut);
     }
 
@@ -514,12 +535,11 @@ mod tests {
         run_shell_job(&job);
         let history = job.clone().log_history();
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].logs.stdout, b"first");
-        assert!(!history[0].logs.entries.is_empty());
+        assert_eq!(output(&history[0].logs, ShellLogStream::Stdout), b"first");
+        assert!(!history[0].logs.is_empty());
         assert!(
             history[0]
                 .logs
-                .entries
                 .iter()
                 .all(|entry| entry.timestamp >= history[0].started_at
                     && entry.timestamp <= history[0].finished_at)
@@ -531,8 +551,8 @@ mod tests {
                 code: Some(0)
             }
         );
-        assert_eq!(history[1].logs.stdout, b"second");
-        assert_eq!(history[1].logs.stderr, b"error");
+        assert_eq!(output(&history[1].logs, ShellLogStream::Stdout), b"second");
+        assert_eq!(output(&history[1].logs, ShellLogStream::Stderr), b"error");
         assert_eq!(
             history[1].outcome,
             JobRunOutcome::Exited {

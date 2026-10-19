@@ -59,15 +59,7 @@ impl ShellControl {
     }
 }
 
-/// A snapshot of bytes captured so far, including output without a newline.
-#[derive(Clone, Debug, Default)]
-pub struct ShellLogs {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    /// Output chunks in capture order; each chunk may contain partial or multiple lines.
-    pub entries: Vec<ShellLogEntry>,
-}
-
+/// An output chunk in capture order; may contain partial or multiple lines.
 #[derive(Clone, Debug)]
 pub struct ShellLogEntry {
     /// Time this output chunk was captured, independent of the display timezone.
@@ -83,7 +75,7 @@ pub enum ShellLogStream {
 }
 
 /// Cloneable input handle for sending bytes or commands to a running shell.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ShellInput {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
 }
@@ -116,8 +108,9 @@ impl ShellInput {
 
 /// Running command with live logs and a shared termination control.
 /// Dropping the handle terminates and reaps the process tree.
+#[derive(Debug)]
 pub struct ShellExecution {
-    logs: Arc<Mutex<ShellLogs>>,
+    logs: Arc<Mutex<Vec<ShellLogEntry>>>,
     input: ShellInput,
     control: ShellControl,
     worker: Option<JoinHandle<Result<Output, ShellRunnerError>>>,
@@ -137,7 +130,7 @@ impl ShellExecution {
         self.input.close();
     }
 
-    pub fn logs(&self) -> ShellLogs {
+    pub fn logs(&self) -> Vec<ShellLogEntry> {
         self.logs.lock().expect("shell logs lock poisoned").clone()
     }
     pub fn terminate(&self) {
@@ -195,7 +188,7 @@ impl ShellRunner {
         let input = ShellInput {
             stdin: Arc::new(Mutex::new(child.stdin.take())),
         };
-        let logs = Arc::new(Mutex::new(ShellLogs::default()));
+        let logs = Arc::new(Mutex::new(Vec::new()));
         let stdout_reader = read_pipe(child.stdout.take().unwrap(), logs.clone(), false);
         let stderr_reader = read_pipe(child.stderr.take().unwrap(), logs.clone(), true);
         let worker_control = control.clone();
@@ -312,7 +305,7 @@ fn configure_process_group(_command: &mut Command) {}
 
 fn read_pipe<R: Read + Send + 'static>(
     mut reader: R,
-    logs: Arc<Mutex<ShellLogs>>,
+    logs: Arc<Mutex<Vec<ShellLogEntry>>>,
     stderr: bool,
 ) -> JoinHandle<io::Result<Vec<u8>>> {
     thread::spawn(move || {
@@ -327,13 +320,7 @@ fn read_pipe<R: Read + Send + 'static>(
             };
             output.extend_from_slice(&buffer[..count]);
             let mut logs = logs.lock().expect("shell logs lock poisoned");
-            let stream = if stderr {
-                &mut logs.stderr
-            } else {
-                &mut logs.stdout
-            };
-            stream.extend_from_slice(&buffer[..count]);
-            logs.entries.push(ShellLogEntry {
+            logs.push(ShellLogEntry {
                 timestamp: SystemTime::now(),
                 stream: if stderr {
                     ShellLogStream::Stderr
@@ -373,6 +360,16 @@ fn stop_process_tree(child: &mut Child) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    fn output(
+        entries: &[crate::service::shell_runner::ShellLogEntry],
+        stream: crate::service::shell_runner::ShellLogStream,
+    ) -> Vec<u8> {
+        entries
+            .iter()
+            .filter(|entry| entry.stream == stream)
+            .flat_map(|entry| entry.bytes.iter().copied())
+            .collect()
+    }
 
     /// 验证进程退出前即可读取标准输出和错误输出，并可通过共享控制对象终止进程树。
     /// Verifies that stdout and stderr are readable before exit and a shared control terminates the running process tree.
@@ -389,7 +386,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let logs = execution.logs();
-            if logs.stdout == b"ready" && logs.stderr == b"error" {
+            if output(&logs, ShellLogStream::Stdout) == b"ready"
+                && output(&logs, ShellLogStream::Stderr) == b"error"
+            {
                 break;
             }
             assert!(Instant::now() < deadline, "live logs did not arrive");
@@ -421,7 +420,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let logs = execution.logs();
-            if logs.stdout == b"hello from shell" && logs.stderr == b"error output" {
+            if output(&logs, ShellLogStream::Stdout) == b"hello from shell"
+                && output(&logs, ShellLogStream::Stderr) == b"error output"
+            {
                 break;
             }
             assert!(Instant::now() < deadline);
@@ -474,18 +475,16 @@ mod tests {
         execution.finish().unwrap();
         let finished_at = SystemTime::now();
         let logs = execution.logs();
-        assert!(!logs.entries.is_empty());
+        assert!(!logs.is_empty());
         assert!(
-            logs.entries
-                .iter()
+            logs.iter()
                 .all(|entry| entry.timestamp >= started_at && entry.timestamp <= finished_at)
         );
         for (stream, expected) in [
-            (ShellLogStream::Stdout, &logs.stdout),
-            (ShellLogStream::Stderr, &logs.stderr),
+            (ShellLogStream::Stdout, b"hello".as_slice()),
+            (ShellLogStream::Stderr, b"error".as_slice()),
         ] {
             let bytes: Vec<u8> = logs
-                .entries
                 .iter()
                 .filter(|entry| entry.stream == stream)
                 .flat_map(|entry| entry.bytes.iter().copied())

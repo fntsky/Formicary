@@ -1,12 +1,11 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::http::{Request, Response};
+use crate::service::shell_runner::{ShellControl, ShellExecution, ShellLogEntry, ShellRunner};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -25,12 +24,7 @@ struct Upstream {
 pub(crate) struct ProxyMount {
     pub(crate) route: String,
     upstream: Upstream,
-    process: Arc<RunningProcess>,
-}
-
-#[derive(Debug)]
-struct RunningProcess {
-    child: Mutex<Child>,
+    execution: Arc<ShellExecution>,
 }
 
 impl ProxyMount {
@@ -44,22 +38,26 @@ impl ProxyMount {
             return Err(invalid_input("proxyhttp script must not be empty"));
         }
         let upstream = parse_upstream(upstream)?;
-        let mut command = command_for(script);
-        configure_process_group(&mut command);
-        let child = command
-            .current_dir(working_directory)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+        let execution =
+            ShellRunner::start(working_directory, script, None, ShellControl::default())?;
 
         Ok(Self {
             route,
             upstream,
-            process: Arc::new(RunningProcess {
-                child: Mutex::new(child),
-            }),
+            execution: Arc::new(execution),
         })
+    }
+
+    /// Returns this proxy's shared shell handle for logs, input, and termination.
+    /// The service lives until the final proxy or shell handle is released.
+    pub(crate) fn shell(&self) -> Arc<ShellExecution> {
+        Arc::clone(&self.execution)
+    }
+
+    /// Returns captured stdout, stderr, and timestamped output entries.
+    /// Logs remain readable after the service exits while this proxy is retained.
+    pub(crate) fn logs(&self) -> Vec<ShellLogEntry> {
+        self.execution.logs()
     }
 
     pub(crate) fn matches(&self, path: &str) -> bool {
@@ -69,7 +67,11 @@ impl ProxyMount {
                 .is_some_and(|suffix| suffix.starts_with('/'))
     }
 
-    pub(crate) fn forward(&self, request: &Request, authenticated_username: Option<&str>) -> Response {
+    pub(crate) fn forward(
+        &self,
+        request: &Request,
+        authenticated_username: Option<&str>,
+    ) -> Response {
         match self.try_forward(request, authenticated_username) {
             Ok(response) => response,
             Err(error) => {
@@ -94,15 +96,12 @@ impl ProxyMount {
         }
     }
 
-    fn try_forward(&self, request: &Request, authenticated_username: Option<&str>) -> io::Result<Response> {
-        if self
-            .process
-            .child
-            .lock()
-            .map_err(|_| io::Error::other("proxy process state is unavailable"))?
-            .try_wait()?
-            .is_some()
-        {
+    fn try_forward(
+        &self,
+        request: &Request,
+        authenticated_username: Option<&str>,
+    ) -> io::Result<Response> {
+        if self.shell().is_finished() {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "proxy service process has exited",
@@ -122,7 +121,8 @@ impl ProxyMount {
             self.upstream.authority,
             request.body.len()
         )?;
-        if let Some(username) = authenticated_username.filter(|value| !value.contains(['\r', '\n'])) {
+        if let Some(username) = authenticated_username.filter(|value| !value.contains(['\r', '\n']))
+        {
             write!(stream, "X-Formicary-User: {username}\r\n")?;
         }
         let connection_headers = connection_header_tokens(&request.headers);
@@ -554,69 +554,84 @@ fn default_reason(code: u16) -> &'static str {
     }
 }
 
-fn command_for(script: &str) -> Command {
-    #[cfg(windows)]
-    let command = {
-        let mut command = Command::new("cmd.exe");
-        command.args(["/C", script]);
-        command
-    };
-    #[cfg(not(windows))]
-    let command = {
-        let mut command = Command::new("sh");
-        command.args(["-c", script]);
-        command
-    };
-    command
-}
-
-#[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
-
-impl Drop for RunningProcess {
-    fn drop(&mut self) {
-        let Ok(child) = self.child.get_mut() else {
-            return;
-        };
-        stop_process_tree(child);
-    }
-}
-
-fn stop_process_tree(child: &mut Child) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as libc::pid_t), libc::SIGTERM);
-    }
-    #[cfg(windows)]
-    {
-        let pid = child.id().to_string();
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid, "/T", "/F"])
-            .status();
-    }
-
-    let deadline = Instant::now() + Duration::from_millis(400);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            _ => break,
-        }
-    }
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::service::shell_runner::ShellLogStream;
+    fn output(
+        entries: &[crate::service::shell_runner::ShellLogEntry],
+        stream: crate::service::shell_runner::ShellLogStream,
+    ) -> Vec<u8> {
+        entries
+            .iter()
+            .filter(|entry| entry.stream == stream)
+            .flat_map(|entry| entry.bytes.iter().copied())
+            .collect()
+    }
+
+    use std::thread;
+    use std::time::Instant;
+
+    /// 验证代理持有 shell 执行句柄，并可读取实时输出、发送输入和终止服务。
+    /// Verifies that a proxy owns its shell execution and supports live logs, input, and termination.
+    #[test]
+    fn proxy_owns_controllable_shell_execution() {
+        let mount = ProxyMount::start(
+            Path::new("."),
+            "printf ready; exec cat",
+            "/test".into(),
+            "http://127.0.0.1:1",
+        )
+        .unwrap();
+        let clone = mount.clone();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while output(&mount.logs(), ShellLogStream::Stdout) != b"ready" {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        clone.shell().send_line("hello").unwrap();
+        while output(&mount.logs(), ShellLogStream::Stdout) != b"readyhello\n" {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        clone.shell().terminate();
+        while !mount.execution.is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!mount.logs().is_empty());
+    }
+
+    /// 验证代理克隆共享进程，最后一个持有者释放后会终止并回收服务进程。
+    /// Verifies that proxy clones share a process and releasing the final owner terminates and reaps it.
+    #[test]
+    fn final_proxy_owner_stops_service() {
+        let mount = ProxyMount::start(
+            Path::new("."),
+            "printf '%s' $$; exec sleep 30",
+            "/test".into(),
+            "http://127.0.0.1:1",
+        )
+        .unwrap();
+        let clone = mount.clone();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let pid = loop {
+            if let Ok(pid) = String::from_utf8_lossy(&output(&mount.logs(), ShellLogStream::Stdout))
+                .parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        };
+        drop(mount);
+        assert!(!clone.execution.is_finished());
+        drop(clone);
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
 }

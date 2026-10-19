@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-use crate::service::shell_runner::{ShellExecution, ShellInput, ShellLogs};
+use crate::service::shell_runner::{ShellExecution, ShellInput, ShellLogEntry};
 
 /// A shared handle to a scheduled shell job.
 ///
@@ -35,7 +35,7 @@ pub struct JobRunLog {
     pub finished_at: SystemTime,
     pub command: String,
     pub working_directory: PathBuf,
-    pub logs: ShellLogs,
+    pub logs: Vec<ShellLogEntry>,
     pub outcome: JobRunOutcome,
 }
 
@@ -57,7 +57,7 @@ impl Job {
     }
 
     /// Live output of the current run; completed runs are available in log_history().
-    pub fn shell_logs(&self) -> Option<ShellLogs> {
+    pub fn shell_logs(&self) -> Option<Vec<ShellLogEntry>> {
         self.execution
             .lock()
             .expect("job execution lock poisoned")
