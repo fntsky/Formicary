@@ -12,7 +12,7 @@ setup-env:
 
 build-ui:
 	npm ci --prefix ui
-	npm run build --prefix ui
+	npm run build --prefix ui -- --outDir ../$(OUTPUT_DIR)/ui --emptyOutDir
 
 build-server: setup-env
 	cargo build --release

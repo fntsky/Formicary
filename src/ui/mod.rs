@@ -30,7 +30,7 @@ fn map_path(request_path: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let mut file_path = PathBuf::from("ui/dist");
+    let mut file_path = ui_directory();
     for segment in relative_path.trim_start_matches('/').split('/') {
         if segment.is_empty() || segment == "." {
             continue;
@@ -45,6 +45,24 @@ fn map_path(request_path: &str) -> Option<PathBuf> {
         file_path.push("index.html");
     }
     Some(file_path)
+}
+
+fn ui_directory() -> PathBuf {
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        let adjacent_ui = directory.join("ui");
+        if adjacent_ui.is_dir() {
+            return adjacent_ui;
+        }
+    }
+
+    let output_ui = PathBuf::from("Output/ui");
+    if output_ui.is_dir() {
+        output_ui
+    } else {
+        PathBuf::from("ui/dist")
+    }
 }
 
 fn not_found() -> Response {

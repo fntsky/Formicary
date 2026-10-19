@@ -142,6 +142,8 @@ impl ChamberManager {
     /// Loads immediate child directories containing `chamber.toml` in name order.
     pub fn load(root: impl AsRef<Path>) -> Result<Self, ChamberManagerError> {
         let root = root.as_ref();
+        fs::create_dir_all(root)
+            .map_err(|error| manager_io_error(root, "could not create Chamber root", error))?;
         let entries = fs::read_dir(root)
             .map_err(|error| manager_io_error(root, "could not read Chamber root", error))?;
         let mut entries = entries

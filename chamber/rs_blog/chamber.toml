@@ -1,9 +1,0 @@
-[chamber]
-name = "rs_blog"
-schema_version = 1
-
-[proxyhttp]
-working_directory = "../../../rs_blog"
-script = "./start.sh"
-upstream = "http://127.0.0.1:53213"
-route = "/blog"
