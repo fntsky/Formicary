@@ -11,41 +11,19 @@ use crate::chamber::Chamber;
 use crate::service::job::Job;
 use crate::service::job_service::{JobServiceError, validate_cron_expression};
 
+pub use crate::chamber::{ProxyHttpMount, StaticWebMount};
+
 const MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1000;
 
 /// Loads the configured Chambers and retains their runtime Job handles.
 pub struct ChamberManager {
-    chambers: Vec<ManagedChamber>,
-    static_web_mounts: Vec<StaticWebMount>,
-    proxy_http_mounts: Vec<ProxyHttpMount>,
-}
-
-struct ManagedChamber {
-    name: String,
-    directory: PathBuf,
-    chamber: Chamber,
+    chambers: Vec<Chamber>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ChamberSummary {
     pub name: String,
     pub job_count: usize,
-}
-
-#[derive(Clone, Debug)]
-pub struct StaticWebMount {
-    pub directory: PathBuf,
-    pub route: String,
-    pub config_path: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-pub struct ProxyHttpMount {
-    pub working_directory: PathBuf,
-    pub script: String,
-    pub upstream: String,
-    pub route: String,
-    pub config_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -156,6 +134,8 @@ struct PreparedChamber {
     name: String,
     directory: PathBuf,
     jobs: Vec<PreparedJob>,
+    static_web_mounts: Vec<StaticWebMount>,
+    proxy_http_mounts: Vec<ProxyHttpMount>,
 }
 
 impl ChamberManager {
@@ -174,8 +154,6 @@ impl ChamberManager {
         entries.sort_by_key(|entry| entry.file_name());
 
         let mut prepared = Vec::new();
-        let mut static_web_mounts = Vec::new();
-        let mut proxy_http_mounts = Vec::new();
         let mut mount_routes = HashSet::new();
         for entry in entries {
             let entry_type = entry.file_type().map_err(|error| {
@@ -241,6 +219,7 @@ impl ChamberManager {
                 ));
             }
 
+            let mut static_web_mounts = Vec::new();
             for static_web in config.staticweb {
                 let route =
                     crate::app::normalize_route_prefix(&static_web.route).map_err(|error| {
@@ -288,6 +267,7 @@ impl ChamberManager {
                 });
             }
 
+            let mut proxy_http_mounts = Vec::new();
             for proxy in config.proxyhttp {
                 let route = crate::app::normalize_route_prefix(&proxy.route).map_err(|error| {
                     validation_error(
@@ -426,12 +406,19 @@ impl ChamberManager {
                 name: config.chamber.name,
                 directory,
                 jobs,
+                static_web_mounts,
+                proxy_http_mounts,
             });
         }
 
         let mut chambers = Vec::with_capacity(prepared.len());
         for prepared_chamber in prepared {
-            let chamber = Chamber::new();
+            let chamber = Chamber::from_config(
+                prepared_chamber.name,
+                prepared_chamber.directory.clone(),
+                prepared_chamber.static_web_mounts,
+                prepared_chamber.proxy_http_mounts,
+            );
             for job in prepared_chamber.jobs {
                 chamber
                     .create_job_with_enabled(
@@ -449,26 +436,22 @@ impl ChamberManager {
                         )
                     })?;
             }
-            chambers.push(ManagedChamber {
-                name: prepared_chamber.name,
-                directory: prepared_chamber.directory,
-                chamber,
-            });
+            chambers.push(chamber);
         }
 
-        Ok(Self {
-            chambers,
-            static_web_mounts,
-            proxy_http_mounts,
-        })
+        Ok(Self { chambers })
     }
 
-    pub fn static_web_mounts(&self) -> &[StaticWebMount] {
-        &self.static_web_mounts
+    pub fn chambers(&self) -> &[Chamber] {
+        &self.chambers
     }
 
-    pub fn proxy_http_mounts(&self) -> &[ProxyHttpMount] {
-        &self.proxy_http_mounts
+    pub fn static_web_mounts(&self) -> impl Iterator<Item = &StaticWebMount> {
+        self.chambers.iter().flat_map(Chamber::static_web_mounts)
+    }
+
+    pub fn proxy_http_mounts(&self) -> impl Iterator<Item = &ProxyHttpMount> {
+        self.chambers.iter().flat_map(Chamber::proxy_http_mounts)
     }
 
     pub fn summaries(&self) -> Vec<ChamberSummary> {
@@ -476,7 +459,7 @@ impl ChamberManager {
             .iter()
             .map(|chamber| ChamberSummary {
                 name: chamber.name.clone(),
-                job_count: chamber.chamber.jobs().len(),
+                job_count: chamber.jobs().len(),
             })
             .collect()
     }
@@ -485,7 +468,7 @@ impl ChamberManager {
         self.chambers
             .iter()
             .find(|chamber| chamber.name == name)
-            .map(|chamber| chamber.chamber.jobs())
+            .map(Chamber::jobs)
     }
 
     pub fn list_jobs(&self) -> Vec<(String, Job)> {
@@ -494,7 +477,6 @@ impl ChamberManager {
             .iter()
             .flat_map(|chamber| {
                 chamber
-                    .chamber
                     .jobs()
                     .into_iter()
                     .map(|job| (chamber.name.clone(), job))
@@ -507,8 +489,8 @@ impl ChamberManager {
 
     pub fn pause_job(&self, id: u64) -> Result<Job, JobServiceError> {
         for chamber in &self.chambers {
-            if chamber.chamber.jobs().iter().any(|job| job.id() == id) {
-                return chamber.chamber.pause_job(id);
+            if chamber.jobs().iter().any(|job| job.id() == id) {
+                return chamber.pause_job(id);
             }
         }
         Err(JobServiceError::NotFound(id))
@@ -516,8 +498,8 @@ impl ChamberManager {
 
     pub fn start_job(&self, id: u64) -> Result<Job, JobServiceError> {
         for chamber in &self.chambers {
-            if chamber.chamber.jobs().iter().any(|job| job.id() == id) {
-                return chamber.chamber.start_job(id);
+            if chamber.jobs().iter().any(|job| job.id() == id) {
+                return chamber.start_job(id);
             }
         }
         Err(JobServiceError::NotFound(id))

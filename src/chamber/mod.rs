@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -8,18 +8,67 @@ use crate::service::job_service::{JobService, JobServiceError};
 pub mod manager;
 pub use manager::ChamberManager;
 
-/// A chamber references the global job service and keeps handles to its jobs.
+#[derive(Clone, Debug)]
+pub struct StaticWebMount {
+    pub directory: PathBuf,
+    pub route: String,
+    pub config_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyHttpMount {
+    pub working_directory: PathBuf,
+    pub script: String,
+    pub upstream: String,
+    pub route: String,
+    pub config_path: PathBuf,
+}
+
+/// A configured Chamber owns its identity, mount configuration, and runtime Jobs.
 pub struct Chamber {
+    pub name: String,
+    pub directory: PathBuf,
     job_service: &'static JobService,
     jobs: Mutex<Vec<Job>>,
+    pub static_web: Vec<StaticWebMount>,
+    pub proxy_http: Vec<ProxyHttpMount>,
 }
 
 impl Chamber {
-    pub fn new() -> Self {
+    /// Creates an in-memory Chamber with no configured mounts.
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
+            name: name.into(),
+            directory: PathBuf::from("."),
             job_service: JobService::global(),
             jobs: Mutex::new(Vec::new()),
+            static_web: Vec::new(),
+            proxy_http: Vec::new(),
         }
+    }
+
+    pub(crate) fn from_config(
+        name: String,
+        directory: PathBuf,
+        static_web: Vec<StaticWebMount>,
+        proxy_http: Vec<ProxyHttpMount>,
+    ) -> Self {
+        Self {
+            name,
+            directory,
+            job_service: JobService::global(),
+            jobs: Mutex::new(Vec::new()),
+            static_web,
+            proxy_http,
+        }
+    }
+
+    pub fn static_web_mounts(&self) -> &[StaticWebMount] {
+        &self.static_web
+    }
+
+    pub fn proxy_http_mounts(&self) -> &[ProxyHttpMount] {
+        &self.proxy_http
     }
 
     pub fn create_job(
@@ -92,11 +141,5 @@ impl Chamber {
         } else {
             Err(JobServiceError::NotFound(id))
         }
-    }
-}
-
-impl Default for Chamber {
-    fn default() -> Self {
-        Self::new()
     }
 }
