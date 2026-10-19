@@ -90,7 +90,7 @@ route = "/api-proxy"
 
 | 字段 | 类型 | 规范 |
 | --- | --- | --- |
-| `directory` | 字符串 | 必填；静态文件目录。相对路径以当前 `chamber.toml` 所在目录为基准；也可使用绝对路径。目录必须存在。 |
+| `directory` | 字符串 | 必填；静态文件目录。若存在覆盖该静态 route 的 `proxyhttp` route，相对路径以其中最长匹配项的 `working_directory` 为基准；否则以当前 `chamber.toml` 所在目录为基准。也可使用绝对路径。目录必须存在。 |
 | `route` | 字符串 | 必填；URL 挂载前缀，例如 `/assets`。可省略开头和结尾的 `/`。跨所有 Chamber 的规范化 route 必须唯一；`/api` 和 `/ui` 前缀保留给应用。 |
 
 启动时，Chamber 加载器解析并校验目录和 route，然后将其注册到应用的挂载表。访问 `/assets/logo.svg` 会读取 `directory/logo.svg`；访问挂载前缀或目录路径时会尝试返回该目录下的 `index.html`。只响应 `GET` 和 `HEAD`。重叠 route 按最长前缀优先匹配。目录越界路径及指向挂载目录外的符号链接不会被提供。

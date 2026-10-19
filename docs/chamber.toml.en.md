@@ -90,7 +90,7 @@ Rules:
 
 | Field | Type | Contract |
 | --- | --- | --- |
-| `directory` | string | Required; static file directory. Relative paths resolve from the directory containing this `chamber.toml`; absolute paths are also allowed. The directory must exist. |
+| `directory` | string | Required; static file directory. If a `proxyhttp` route contains this static route, relative paths resolve from the `working_directory` of the longest matching proxy route; otherwise they resolve from the directory containing this `chamber.toml`. Absolute paths are also allowed. The directory must exist. |
 | `route` | string | Required; URL mount prefix such as `/assets`. Leading and trailing slashes are optional. Normalized routes must be unique across all loaded Chambers; `/api` and `/ui` prefixes are reserved for the application. |
 
 At startup, the Chamber loader resolves and validates each directory and route, then registers it in the application's mount registry. A request for `/assets/logo.svg` reads `directory/logo.svg`; requests for the mount prefix or a directory path try to serve that directory's `index.html`. Only `GET` and `HEAD` are served. Overlapping routes use the longest matching prefix. Traversal outside the mount and symlinks that point outside it are not served.

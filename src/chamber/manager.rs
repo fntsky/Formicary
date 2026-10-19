@@ -221,6 +221,22 @@ impl ChamberManager {
                 ));
             }
 
+            let proxy_working_directories = config
+                .proxyhttp
+                .iter()
+                .filter_map(|proxy| {
+                    let route = crate::app::normalize_route_prefix(&proxy.route).ok()?;
+                    let configured_directory =
+                        PathBuf::from(proxy.working_directory.as_deref().unwrap_or("."));
+                    let working_directory = if configured_directory.is_absolute() {
+                        configured_directory
+                    } else {
+                        directory.join(configured_directory)
+                    };
+                    Some((route, working_directory))
+                })
+                .collect::<Vec<_>>();
+
             let mut static_web_mounts = Vec::new();
             for static_web in config.staticweb {
                 let route =
@@ -241,7 +257,13 @@ impl ChamberManager {
                 let directory_path = if configured_directory.is_absolute() {
                     configured_directory
                 } else {
-                    directory.join(configured_directory)
+                    let working_directory = proxy_working_directories
+                        .iter()
+                        .filter(|(proxy_route, _)| route_is_within(&route, proxy_route))
+                        .max_by_key(|(proxy_route, _)| proxy_route.len())
+                        .map(|(_, working_directory)| working_directory.as_path())
+                        .unwrap_or(directory.as_path());
+                    working_directory.join(configured_directory)
                 };
                 let static_directory = fs::canonicalize(&directory_path).map_err(|error| {
                     validation_error(
@@ -517,6 +539,14 @@ impl ChamberManager {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn route_is_within(route: &str, prefix: &str) -> bool {
+    prefix == "/"
+        || route == prefix
+        || route
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn parse_chamber_file(source: &str) -> Result<ChamberFile, toml::de::Error> {
