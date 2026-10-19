@@ -110,7 +110,7 @@ route = "/api-proxy"
 
 应用启动时会在 `working_directory` 中启动 `script`，并把匹配 route 的请求转发到 upstream。转发时会剥离 route 前缀并保留查询串；例如 `/api-proxy/items?id=1` 会转发为 upstream 的 `/items?id=1`。若 upstream URL 含基础路径，则该路径会保留在转发目标中。常见请求头、请求体、响应状态码和响应头会被转发；连接相关头由代理重新生成。当前入站请求体上限为 16 KiB，代理响应会缓冲且上限为 64 MiB。服务启动期间 upstream 尚未就绪时，请求会得到 `502 Bad Gateway`，连接超时会得到 `504 Gateway Timeout`。
 
-`script` 按受信任的本地 shell 命令处理，应让服务以前台进程运行。注销代理 route 时会终止该启动命令的进程组；已有请求完成后再释放服务进程。`App::global()` 的 `register_proxy_http(working_directory, script, route, upstream)` 和 `unregister_proxy_http(route)` 也可在运行期间动态增加或移除代理。配置和脚本不得由不可信用户输入生成。
+`script` 按受信任的本地 shell 命令处理，应让服务以前台进程运行。注销代理 route 时会终止该启动命令的进程组；已有请求完成后再释放服务进程。按 `Ctrl+C` 退出时会关闭所有 Chamber 并清理其启动的代理进程。`App::global()` 的 `register_proxy_http(working_directory, script, route, upstream)` 和 `unregister_proxy_http(route)` 也可在运行期间动态增加或移除代理。配置和脚本不得由不可信用户输入生成。
 
 ## 6. Cron 时间
 

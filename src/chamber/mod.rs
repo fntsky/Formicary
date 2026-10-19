@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::app::App;
 use crate::service::job::Job;
 use crate::service::job_service::{JobService, JobServiceError};
 
@@ -132,6 +133,21 @@ impl Chamber {
 
     pub fn job_service(&self) -> &'static JobService {
         self.job_service
+    }
+
+    pub fn close(&self, app: &App) -> std::io::Result<()> {
+        let mut first_error = None;
+        for mount in &self.proxy_http {
+            if let Err(error) = app.unregister_proxy_http(&mount.route) {
+                first_error.get_or_insert(error);
+            }
+        }
+        for mount in &self.static_web {
+            if let Err(error) = app.unregister_static_directory(&mount.route) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn ensure_contains_job(&self, id: u64) -> Result<(), JobServiceError> {

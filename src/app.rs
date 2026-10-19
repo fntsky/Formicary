@@ -4,8 +4,11 @@ use std::fs;
 use std::io;
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::thread;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use rusqlite::Connection;
 use serde_json::json;
@@ -19,6 +22,8 @@ const DEFAULT_DATABASE_PATH: &str = "data/auth.sqlite3";
 const DEFAULT_CHAMBERS_DIR: &str = "./chamber";
 
 static GLOBAL_APP: OnceLock<App> = OnceLock::new();
+static CTRL_C_REQUESTED: AtomicBool = AtomicBool::new(false);
+static CTRL_C_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct StaticDirectory {
@@ -215,12 +220,16 @@ pub fn run() -> io::Result<()> {
 }
 
 fn run_server(app: &App) -> io::Result<()> {
+    CTRL_C_REQUESTED.store(false, Ordering::Release);
+    install_ctrl_c_handler()?;
+
     let config = load_config()?;
     let chambers = ChamberManager::load(&config.chambers_dir)
         .map_err(|error| io::Error::other(format!("could not load Chambers: {error}")))?;
     let mut database = initialize(&config)
         .map_err(|error| io::Error::other(format!("could not initialize application: {error}")))?;
     let listener = TcpListener::bind((config.host.as_str(), config.port))?;
+    listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let mut registered_static_routes = Vec::new();
     let mut registered_proxy_routes = Vec::new();
@@ -263,46 +272,72 @@ fn run_server(app: &App) -> io::Result<()> {
     };
     println!("管理控制面板: http://{control_host}:{}/ui", address.port());
 
-    for connection in listener.incoming() {
-        let mut stream = match connection {
-            Ok(stream) => stream,
-            Err(error) => {
-                eprintln!("HTTP connection error: {error}");
-                continue;
-            }
-        };
+    let server_result = (|| {
+        while !CTRL_C_REQUESTED.load(Ordering::Acquire) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    eprintln!("HTTP connection error: {error}");
+                    continue;
+                }
+            };
 
-        match http::read_request(&stream) {
-            Ok(Some(request)) => {
-                let mounts = match app.mounts.read() {
-                    Ok(mounts) => (mounts.static_directories.clone(), mounts.proxy_http.clone()),
-                    Err(_) => {
-                        eprintln!("Mount registry is unavailable");
-                        let response = Response::json(
-                            "500 Internal Server Error",
-                            json!({"error": "服务器内部错误。"}),
-                        );
-                        http::write_response(&mut stream, &response, request.method == "HEAD")?;
-                        continue;
-                    }
-                };
-                let response =
-                    handle_request(&request, &mut database, &chambers, &mounts.0, &mounts.1);
-                http::write_response(&mut stream, &response, request.method == "HEAD")?;
+            match http::read_request(&stream) {
+                Ok(Some(request)) => {
+                    let mounts = match app.mounts.read() {
+                        Ok(mounts) => {
+                            (mounts.static_directories.clone(), mounts.proxy_http.clone())
+                        }
+                        Err(_) => {
+                            eprintln!("Mount registry is unavailable");
+                            let response = Response::json(
+                                "500 Internal Server Error",
+                                json!({"error": "服务器内部错误。"}),
+                            );
+                            http::write_response(&mut stream, &response, request.method == "HEAD")?;
+                            continue;
+                        }
+                    };
+                    let response =
+                        handle_request(&request, &mut database, &chambers, &mounts.0, &mounts.1);
+                    http::write_response(&mut stream, &response, request.method == "HEAD")?;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let response = if error.kind() == io::ErrorKind::FileTooLarge {
+                        Response::json("413 Payload Too Large", json!({"error": "请求内容过大。"}))
+                    } else {
+                        Response::json("400 Bad Request", json!({"error": "无法读取请求。"}))
+                    };
+                    http::write_response(&mut stream, &response, false)?;
+                }
             }
-            Ok(None) => {}
-            Err(error) => {
-                let response = if error.kind() == io::ErrorKind::FileTooLarge {
-                    Response::json("413 Payload Too Large", json!({"error": "请求内容过大。"}))
-                } else {
-                    Response::json("400 Bad Request", json!({"error": "无法读取请求。"}))
-                };
-                http::write_response(&mut stream, &response, false)?;
-            }
+        }
+        Ok(())
+    })();
+
+    for chamber in chambers.chambers() {
+        if let Err(error) = chamber.close(app) {
+            eprintln!("Could not close Chamber {}: {error}", chamber.name);
         }
     }
 
-    Ok(())
+    server_result
+}
+
+fn install_ctrl_c_handler() -> io::Result<()> {
+    match CTRL_C_HANDLER.get_or_init(|| {
+        ctrlc::set_handler(|| CTRL_C_REQUESTED.store(true, Ordering::Release))
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(io::Error::other(error.clone())),
+    }
 }
 
 fn rollback_mounts(app: &App, static_routes: &[String], proxy_routes: &[String]) {
