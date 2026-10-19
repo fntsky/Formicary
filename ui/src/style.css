@@ -484,3 +484,35 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   .refresh-button { padding: 0 8px; }
   .detail-tabs { gap: 13px; }
 }
+
+.github-download { margin-bottom: 24px; }
+.github-download > p { color: var(--text-muted, #667085); font-size: 13px; }
+.github-download fieldset { border: 0; padding: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.github-download label { display: grid; gap: 6px; font-size: 13px; }
+.github-download input { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #d8dfda; border-radius: 8px; }
+.github-download button { align-self: end; }
+
+.dashboard-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.import-trigger { margin: 0; width: auto; white-space: nowrap; }
+.import-dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); box-sizing: border-box; padding: 28px; border: 1px solid #d8dfda; border-radius: 18px; color: #24352c; background: #fff; box-shadow: 0 24px 80px #15281e33; overflow-y: auto; }
+.import-dialog::backdrop { background: #14251fcc; backdrop-filter: blur(4px); }
+.import-dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.import-dialog-heading h2 { margin: 6px 0; font-size: 22px; }
+.dialog-close { border: 0; background: transparent; font-size: 28px; cursor: pointer; color: #667085; }
+.dialog-close:disabled { opacity: .4; cursor: wait; }
+.import-dialog > p { font-size: 13px; line-height: 1.7; color: #667085; margin-bottom: 24px; }
+.import-dialog .github-download { margin-bottom: 0; }
+.import-dialog fieldset { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 16px; }
+.repository-field { grid-column: 1 / -1; }
+.import-dialog input:focus-visible { outline: 2px solid #408d65; outline-offset: 2px; }
+.import-dialog-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }
+.import-dialog-actions .primary-button { width: auto; margin: 0; }
+.import-progress { margin-top: 24px; }
+.import-progress-label { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px; }
+.import-progress progress { display: block; width: 100%; height: 10px; accent-color: #408d65; }
+.import-progress-help { color: #667085; font-size: 12px; }
+@media (max-width: 480px) { .import-dialog { padding: 20px; } .import-dialog fieldset { grid-template-columns: 1fr; } }
+
+.github-download select { width: 100%; min-width: 0; padding: 10px; border: 1px solid #d8dfda; border-radius: 8px; background: #fff; color: inherit; font: inherit; }
+.github-download select:focus-visible { outline: 2px solid #408d65; outline-offset: 2px; }
+#branch-status { font-size: 12px; color: #667085; }

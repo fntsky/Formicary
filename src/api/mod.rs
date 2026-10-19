@@ -70,7 +70,8 @@ pub fn create_initial_account(
 pub fn handle(
     request: &Request,
     database: &mut Connection,
-    chambers: &ChamberManager,
+    chambers: &mut ChamberManager,
+    app: &crate::app::App,
 ) -> rusqlite::Result<Response> {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/api") => Ok(Response::json(
@@ -97,7 +98,9 @@ pub fn handle(
         ("POST", "/api/logout") => logout(request, database),
         ("POST", "/api/admin/username") => change_username(request, database),
         ("POST", "/api/admin/password") => change_password(request, database),
-        _ if chambers::matches_path(&request.path) => chambers::handle(request, database, chambers),
+        _ if chambers::matches_path(&request.path) => {
+            chambers::handle(request, database, chambers, app)
+        }
         (_, "/api/register") => Ok(Response::json(
             "410 Gone",
             json!({"error": "用户注册已停用，此服务只支持管理员账户。"}),

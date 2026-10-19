@@ -18,9 +18,42 @@ pub(super) fn matches_path(path: &str) -> bool {
 pub(super) fn handle(
     request: &Request,
     database: &Connection,
-    chambers: &ChamberManager,
+    chambers: &mut ChamberManager,
+    app: &crate::app::App,
 ) -> rusqlite::Result<Response> {
     match (request.method.as_str(), request.path.as_str()) {
+        ("POST", "/api/chambers/github/branches") => {
+            if authenticated_user_id(request, database)?.is_none() {
+                return Ok(unauthorized_response());
+            }
+            #[derive(serde::Deserialize)]
+            struct Repository {
+                repository: String,
+            }
+            let input: Repository = match super::parse_json_body(request) {
+                Ok(value) => value,
+                Err(response) => return Ok(response),
+            };
+            Ok(
+                match crate::chamber::github::list_branches(&input.repository) {
+                    Ok(branches) => Response::json("200 OK", json!(branches)),
+                    Err(error) => Response::json("400 Bad Request", json!({"error": error})),
+                },
+            )
+        }
+        ("POST", "/api/chambers/import") => {
+            if authenticated_user_id(request, database)?.is_none() {
+                return Ok(unauthorized_response());
+            }
+            let download: crate::chamber::github::Download = match super::parse_json_body(request) {
+                Ok(value) => value,
+                Err(response) => return Ok(response),
+            };
+            Ok(match chambers.import_github(&download, app) {
+                Ok(name) => Response::json("201 Created", json!({"name": name})),
+                Err(error) => Response::json("400 Bad Request", json!({"error": error})),
+            })
+        }
         ("GET", "/api/chambers") => list_chambers(request, database, chambers),
         ("GET", "/api/jobs") => list_jobs(request, database, chambers),
         _ if request.path.starts_with("/api/chambers/") => {

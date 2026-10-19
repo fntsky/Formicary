@@ -224,7 +224,7 @@ fn run_server(app: &App) -> io::Result<()> {
     install_ctrl_c_handler()?;
 
     let config = load_config()?;
-    let chambers = ChamberManager::load(&config.chambers_dir)
+    let mut chambers = ChamberManager::load(&config.chambers_dir)
         .map_err(|error| io::Error::other(format!("could not load Chambers: {error}")))?;
     let mut database = initialize(&config)
         .map_err(|error| io::Error::other(format!("could not initialize application: {error}")))?;
@@ -303,8 +303,14 @@ fn run_server(app: &App) -> io::Result<()> {
                             continue;
                         }
                     };
-                    let response =
-                        handle_request(&request, &mut database, &chambers, &mounts.0, &mounts.1);
+                    let response = handle_request(
+                        &request,
+                        &mut database,
+                        &mut chambers,
+                        app,
+                        &mounts.0,
+                        &mounts.1,
+                    );
                     http::write_response(&mut stream, &response, request.method == "HEAD")?;
                 }
                 Ok(None) => {}
@@ -378,12 +384,13 @@ pub fn initialize(config: &Config) -> Result<Connection, Box<dyn Error>> {
 fn handle_request(
     request: &Request,
     database: &mut Connection,
-    chambers: &ChamberManager,
+    chambers: &mut ChamberManager,
+    app: &App,
     static_directories: &[StaticDirectory],
     proxy_http: &[ProxyMount],
 ) -> Response {
     if api::is_api_path(&request.path) {
-        return match api::handle(request, database, chambers) {
+        return match api::handle(request, database, chambers, app) {
             Ok(response) => response,
             Err(error) => {
                 eprintln!("API database error: {error}");

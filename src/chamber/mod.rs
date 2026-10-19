@@ -6,6 +6,7 @@ use crate::app::App;
 use crate::service::job::Job;
 use crate::service::job_service::{JobService, JobServiceError};
 
+pub mod github;
 pub mod manager;
 pub use manager::ChamberManager;
 

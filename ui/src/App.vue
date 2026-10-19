@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch, onBeforeUnmount } from 'vue'
 
 const username = ref('')
 const password = ref('')
@@ -54,6 +54,89 @@ async function postJson(endpoint, payload) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   })
+}
+
+const importDialog = ref(null)
+const importButton = ref(null)
+const importStage = ref('')
+
+function openImportDialog() {
+  githubError.value = ''
+  githubMessage.value = ''
+  importStage.value = ''
+  importDialog.value.showModal()
+}
+
+function closeImportDialog() {
+  if (downloadingGithub.value) return
+  importDialog.value.close()
+  importButton.value?.focus()
+}
+
+const github = ref({ repository: '', branch: '', depth: 1 })
+const downloadingGithub = ref(false)
+const githubMessage = ref('')
+const githubError = ref('')
+
+const githubBranches = ref([])
+const githubDefaultBranch = ref('')
+const loadingGithubBranches = ref(false)
+const githubBranchError = ref('')
+let branchRequestId = 0
+let branchTimer
+
+watch(() => github.value.repository, () => {
+  clearTimeout(branchTimer)
+  branchRequestId++
+  githubBranches.value = []
+  github.value.branch = ''
+  githubDefaultBranch.value = ''
+  githubBranchError.value = ''
+  loadingGithubBranches.value = !!github.value.repository.trim()
+  if (loadingGithubBranches.value) branchTimer = setTimeout(fetchGithubBranches, 600)
+})
+onBeforeUnmount(() => { clearTimeout(branchTimer); branchRequestId++ })
+
+async function fetchGithubBranches() {
+  clearTimeout(branchTimer)
+  const requestId = ++branchRequestId
+  loadingGithubBranches.value = true
+  githubBranchError.value = ''
+  try {
+    const data = await postJson('/api/chambers/github/branches', { repository: github.value.repository })
+    if (requestId !== branchRequestId) return
+    githubBranches.value = data.branches
+    githubDefaultBranch.value = data.default_branch || ''
+    github.value.branch = data.branches.includes(data.default_branch) ? data.default_branch : data.branches[0]
+  } catch (error) {
+    if (requestId === branchRequestId) githubBranchError.value = error.message
+  } finally {
+    if (requestId === branchRequestId) loadingGithubBranches.value = false
+  }
+}
+
+async function downloadGithub() {
+  if (downloadingGithub.value || githubMessage.value || loadingGithubBranches.value || !github.value.branch) return
+  downloadingGithub.value = true
+  githubMessage.value = ''
+  githubError.value = ''
+  importStage.value = '正在下载仓库并加载 Chamber…'
+  try {
+    const data = await postJson('/api/chambers/import', {
+      ...github.value,
+      depth: github.value.depth === '' ? null : Number(github.value.depth),
+    })
+    importStage.value = '正在刷新 Chamber 列表…'
+    selectedChamber.value = data.name
+    await loadChambers()
+    importStage.value = '导入完成'
+    githubMessage.value = `Chamber ${data.name} 已导入并加载。`
+  } catch (error) {
+    importStage.value = '导入失败'
+    githubError.value = error.message
+  } finally {
+    downloadingGithub.value = false
+  }
 }
 
 async function loadChamber(name) {
@@ -319,13 +402,55 @@ onMounted(async () => {
           <h1>Chamber 管理</h1>
           <p class="dashboard-subtitle">查看已加载的 Chamber、定时任务和服务挂载。</p>
         </div>
+        <div class="dashboard-actions">
+        <button ref="importButton" class="primary-button import-trigger" type="button" @click="openImportDialog">＋ 从 GitHub 导入</button>
         <button class="refresh-button" type="button" :disabled="refreshing" @click="refreshChambers">
           <span aria-hidden="true">↻</span>{{ refreshing ? '正在刷新' : '刷新数据' }}
         </button>
+        </div>
       </div>
 
       <p v-if="chamberError" class="dashboard-message error-message" role="alert">{{ chamberError }}</p>
       <p v-if="chamberNotice" class="dashboard-message notice-message" role="status">{{ chamberNotice }}</p>
+
+
+
+      <dialog ref="importDialog" class="import-dialog" aria-labelledby="import-title" aria-describedby="import-description" @cancel.prevent="closeImportDialog" @click="($event.target === importDialog) && closeImportDialog()">
+        <div class="import-dialog-heading">
+          <div><p class="eyebrow">IMPORT CHAMBER</p><h2 id="import-title">从 GitHub 导入</h2></div>
+          <button class="dialog-close" type="button" aria-label="关闭导入弹窗" :disabled="downloadingGithub" @click="closeImportDialog">×</button>
+        </div>
+        <p id="import-description">仓库将自动下载到 Chamber 目录，以 chamber.toml 中的名称创建子目录。导入后会启用配置的任务和服务。</p>
+        <form class="github-download" :aria-busy="downloadingGithub" @submit.prevent="downloadGithub">
+          <fieldset :disabled="downloadingGithub || !!githubMessage">
+            <label class="repository-field">GitHub 仓库<input v-model="github.repository" autofocus required placeholder="owner/repo 或 https://github.com/owner/repo" /></label>
+            <label>目标分支
+              <select v-model="github.branch" required :disabled="loadingGithubBranches || !githubBranches.length" aria-describedby="branch-status">
+                <option disabled value="">{{ loadingGithubBranches ? '正在获取分支…' : '请先填写仓库地址' }}</option>
+                <option v-for="branch in githubBranches" :key="branch" :value="branch">{{ branch }}{{ branch === githubDefaultBranch ? '（默认）' : '' }}</option>
+              </select>
+            </label>
+            <div id="branch-status" class="repository-field" aria-live="polite">
+              <span v-if="loadingGithubBranches">正在自动获取仓库分支…</span>
+              <template v-else-if="githubBranchError"><span class="error-message">{{ githubBranchError }}</span> <button type="button" class="inline-link" @click="fetchGithubBranches">重新获取</button></template>
+              <span v-else-if="githubBranches.length">已获取 {{ githubBranches.length }} 个分支，可切换目标分支。</span>
+            </div>
+            <label>下载深度<input v-model="github.depth" type="number" min="1" max="4294967295" step="1" placeholder="留空下载完整历史" /></label>
+          </fieldset>
+          <div v-if="importStage" class="import-progress" aria-live="polite">
+            <div class="import-progress-label"><span>{{ importStage }}</span><span v-if="githubMessage">100%</span></div>
+            <progress v-if="downloadingGithub" aria-label="Chamber 导入进行中"></progress>
+            <progress v-else-if="githubMessage" aria-label="Chamber 导入完成" :value="100" :max="100"></progress>
+            <p v-if="downloadingGithub" class="import-progress-help">请稍候，下载及加载期间请保持此窗口打开。</p>
+          </div>
+          <p v-if="githubError" class="error-message" role="alert">{{ githubError }}</p>
+          <p v-if="githubMessage" class="notice-message" role="status">{{ githubMessage }}</p>
+          <div class="import-dialog-actions">
+            <button class="refresh-button" type="button" :disabled="downloadingGithub" @click="closeImportDialog">{{ githubMessage ? '完成' : '取消' }}</button>
+            <button v-if="!githubMessage" class="primary-button" type="submit" :disabled="downloadingGithub || loadingGithubBranches || !github.branch">{{ downloadingGithub ? '正在导入…' : githubError ? '重试导入' : '导入 Chamber' }}</button>
+          </div>
+        </form>
+      </dialog>
 
       <section class="metric-grid" aria-label="服务统计">
         <article class="metric-card">
@@ -402,6 +527,7 @@ onMounted(async () => {
             </nav>
 
             <div v-if="chamberTab === 'overview'" class="detail-body">
+
               <div class="overview-stats">
                 <article><span class="mini-stat-icon">◷</span><div><span>定时任务</span><strong>{{ chamberDetails.job_count }}</strong></div></article>
                 <article><span class="mini-stat-icon">✓</span><div><span>已启用</span><strong>{{ chamberDetails.enabled_job_count }}</strong></div></article>

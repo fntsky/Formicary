@@ -18,6 +18,7 @@ const MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1000;
 /// Loads the configured Chambers and retains their runtime Job handles.
 pub struct ChamberManager {
     chambers: Vec<Chamber>,
+    root: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -141,7 +142,10 @@ struct PreparedChamber {
 impl ChamberManager {
     /// Loads immediate child directories containing `chamber.toml` in name order.
     pub fn load(root: impl AsRef<Path>) -> Result<Self, ChamberManagerError> {
-        let root = root.as_ref();
+        Self::load_directory(root.as_ref(), None)
+    }
+
+    fn load_directory(root: &Path, only: Option<&str>) -> Result<Self, ChamberManagerError> {
         fs::create_dir_all(root)
             .map_err(|error| manager_io_error(root, "could not create Chamber root", error))?;
         let entries = fs::read_dir(root)
@@ -158,6 +162,9 @@ impl ChamberManager {
         let mut prepared = Vec::new();
         let mut mount_routes = HashSet::new();
         for entry in entries {
+            if only.is_some_and(|name| entry.file_name() != name) {
+                continue;
+            }
             let entry_type = entry.file_type().map_err(|error| {
                 manager_io_error(&entry.path(), "could not inspect directory entry", error)
             })?;
@@ -463,7 +470,83 @@ impl ChamberManager {
             chambers.push(chamber);
         }
 
-        Ok(Self { chambers })
+        Ok(Self {
+            chambers,
+            root: root.to_path_buf(),
+        })
+    }
+
+    pub fn import_github(
+        &mut self,
+        download: &crate::chamber::github::Download,
+        app: &crate::app::App,
+    ) -> Result<String, String> {
+        let staging_name = format!("import-{}", uuid::Uuid::new_v4());
+        let staged_download = crate::chamber::github::Download {
+            repository: download.repository.clone(),
+            branch: download.branch.clone(),
+            depth: download.depth,
+            directory: staging_name.clone(),
+        };
+        staged_download.run(&self.root)?;
+        let mut directory = self.root.join(&staging_name);
+        let result = (|| {
+            if !directory.join("chamber.toml").is_file() {
+                return Err("仓库根目录缺少 chamber.toml，无法导入 Chamber。".into());
+            }
+            let name = imported_chamber_name(&directory)?;
+            let destination = self.root.join(&name);
+            if destination
+                .try_exists()
+                .map_err(|error| error.to_string())?
+                || self.chambers.iter().any(|chamber| chamber.name == name)
+            {
+                return Err(format!("Chamber {name} 已存在，无法重复导入。"));
+            }
+            fs::rename(&directory, &destination)
+                .map_err(|error| format!("无法保存 Chamber：{error}"))?;
+            directory = destination;
+            let mut imported =
+                Self::load_directory(&self.root, Some(&name)).map_err(|error| error.to_string())?;
+            let chamber = imported.chambers.pop().ok_or("没有找到 Chamber 配置。")?;
+            let mut static_routes = Vec::new();
+            let mut proxy_routes = Vec::new();
+            let mounts = (|| -> std::io::Result<()> {
+                for mount in chamber.static_web_mounts() {
+                    app.register_static_directory(&mount.directory, &mount.route)?;
+                    static_routes.push(mount.route.clone());
+                }
+                for mount in chamber.proxy_http_mounts() {
+                    app.register_proxy_http(
+                        &mount.working_directory,
+                        &mount.script,
+                        &mount.route,
+                        &mount.upstream,
+                    )?;
+                    proxy_routes.push(mount.route.clone());
+                }
+                Ok(())
+            })();
+            if let Err(error) = mounts {
+                for route in proxy_routes {
+                    let _ = app.unregister_proxy_http(route);
+                }
+                for route in static_routes {
+                    let _ = app.unregister_static_directory(route);
+                }
+                for job in chamber.jobs() {
+                    let _ = chamber.pause_job(job.id());
+                }
+                return Err(format!("无法加载 Chamber 挂载：{error}"));
+            }
+            self.chambers.push(chamber);
+            self.chambers.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(name)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(directory);
+        }
+        result
     }
 
     pub fn chambers(&self) -> &[Chamber] {
@@ -547,6 +630,17 @@ fn route_is_within(route: &str, prefix: &str) -> bool {
         || route
             .strip_prefix(prefix)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn imported_chamber_name(directory: &Path) -> Result<String, String> {
+    let source = fs::read_to_string(directory.join("chamber.toml"))
+        .map_err(|error| format!("无法读取 chamber.toml：{error}"))?;
+    let config =
+        parse_chamber_file(&source).map_err(|error| format!("Chamber 配置无效：{error}"))?;
+    if !crate::chamber::github::valid_component(&config.chamber.name) {
+        return Err("Chamber 配置中的名称不能作为安全的目录名。".into());
+    }
+    Ok(config.chamber.name)
 }
 
 fn parse_chamber_file(source: &str) -> Result<ChamberFile, toml::de::Error> {
