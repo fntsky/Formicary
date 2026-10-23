@@ -13,7 +13,7 @@ const notice = ref('')
 const busy = ref(false)
 
 const activePage = ref('chambers')
-const chamberTab = ref('overview')
+const chamberTab = ref('mounts')
 const chambers = ref([])
 const selectedChamber = ref('')
 const chamberDetails = ref(null)
@@ -441,9 +441,7 @@ onMounted(async () => {
     <main v-else-if="activePage === 'chambers'" class="dashboard-main">
       <div class="dashboard-heading">
         <div>
-          <p class="eyebrow">SERVICE OVERVIEW</p>
           <h1>Chamber 管理</h1>
-          <p class="dashboard-subtitle">查看已加载的 Chamber、定时任务和服务挂载。</p>
         </div>
         <div class="dashboard-actions">
         <button ref="importButton" class="primary-button import-trigger" type="button" @click="openImportDialog">＋ 从 GitHub 导入</button>
@@ -455,8 +453,6 @@ onMounted(async () => {
 
       <p v-if="chamberError" class="dashboard-message error-message" role="alert">{{ chamberError }}</p>
       <p v-if="chamberNotice" class="dashboard-message notice-message" role="status">{{ chamberNotice }}</p>
-
-
 
       <dialog ref="importDialog" class="import-dialog" aria-labelledby="import-title" aria-describedby="import-description" @cancel.prevent="closeImportDialog" @click="($event.target === importDialog) && closeImportDialog()">
         <div class="import-dialog-heading">
@@ -495,25 +491,16 @@ onMounted(async () => {
         </form>
       </dialog>
 
-      <section class="metric-grid" aria-label="服务统计">
-        <article class="metric-card">
-          <span class="metric-icon green-icon" aria-hidden="true">◈</span>
-          <div><p>已加载 Chamber</p><strong>{{ chambers.length }}</strong></div>
-        </article>
-        <article class="metric-card">
-          <span class="metric-icon blue-icon" aria-hidden="true">◷</span>
-          <div><p>定时任务</p><strong>{{ totalJobs }}</strong><small>{{ enabledJobs }} 个已启用</small></div>
-        </article>
-        <article class="metric-card">
-          <span class="metric-icon amber-icon" aria-hidden="true">⌘</span>
-          <div><p>服务挂载</p><strong>{{ totalMounts }}</strong><small>静态目录和 HTTP 代理</small></div>
-        </article>
-      </section>
+      <div class="service-summary" aria-label="服务统计">
+        <span><strong>{{ chambers.length }}</strong> Chambers</span>
+        <span><strong>{{ totalJobs }}</strong> 定时任务 <small>{{ enabledJobs }} 已启用</small></span>
+        <span><strong>{{ totalMounts }}</strong> 服务挂载</span>
+      </div>
 
       <section class="chamber-layout">
         <aside class="chamber-list-panel" aria-label="Chamber 列表">
           <div class="panel-heading">
-            <div><h2>Chambers</h2><p>配置目录中的服务模块</p></div>
+            <h2>Chambers</h2>
             <span class="count-pill">{{ chambers.length }}</span>
           </div>
 
@@ -521,7 +508,6 @@ onMounted(async () => {
           <div v-else-if="!chambers.length" class="panel-empty">
             <span class="empty-mark" aria-hidden="true">◈</span>
             <strong>还没有 Chamber</strong>
-            <span>在配置目录中添加 Chamber 后会显示在这里。</span>
           </div>
           <div v-else class="chamber-list">
             <button
@@ -541,7 +527,6 @@ onMounted(async () => {
             </button>
           </div>
 
-          <div class="list-panel-footer"><span class="live-dot"></span> 配置已加载</div>
         </aside>
 
         <section class="chamber-detail-panel" aria-live="polite">
@@ -549,7 +534,6 @@ onMounted(async () => {
           <div v-else-if="!chamberDetails" class="detail-empty">
             <span class="empty-mark" aria-hidden="true">◈</span>
             <strong>{{ chambers.length ? '选择一个 Chamber' : '等待 Chamber 配置' }}</strong>
-            <span>{{ chambers.length ? '从左侧列表选择服务以查看详情。' : '检测到 Chamber 后，详情和任务会显示在这里。' }}</span>
           </div>
           <template v-else>
             <div class="detail-heading">
@@ -560,54 +544,15 @@ onMounted(async () => {
                   <p class="path-label"><span aria-hidden="true">⌂</span>{{ chamberDetails.directory }}</p>
                 </div>
               </div>
-              <span class="config-label">SCHEMA V1</span>
             </div>
 
             <nav class="detail-tabs" aria-label="Chamber 详情">
-              <button :class="{ selected: chamberTab === 'overview' }" @click="chamberTab = 'overview'">概览</button>
               <button :class="{ selected: chamberTab === 'jobs' }" @click="chamberTab = 'jobs'">定时任务 <span>{{ chamberDetails.job_count }}</span></button>
               <button :class="{ selected: chamberTab === 'mounts' }" @click="chamberTab = 'mounts'">服务挂载 <span>{{ chamberDetails.static_web.length + chamberDetails.proxy_http.length }}</span></button>
             </nav>
 
-            <div v-if="chamberTab === 'overview'" class="detail-body">
-
-              <div class="overview-stats">
-                <article><span class="mini-stat-icon">◷</span><div><span>定时任务</span><strong>{{ chamberDetails.job_count }}</strong></div></article>
-                <article><span class="mini-stat-icon">✓</span><div><span>已启用</span><strong>{{ chamberDetails.enabled_job_count }}</strong></div></article>
-                <article><span class="mini-stat-icon">⌘</span><div><span>静态挂载</span><strong>{{ chamberDetails.static_web.length }}</strong></div></article>
-                <article><span class="mini-stat-icon">⇄</span><div><span>HTTP 代理</span><strong>{{ chamberDetails.proxy_http.length }}</strong></div></article>
-              </div>
-
-              <div class="overview-grid">
-                <section class="content-card">
-                  <div class="content-card-heading"><div><h3>任务预览</h3><p>此 Chamber 中配置的定时任务</p></div><button class="inline-link" @click="chamberTab = 'jobs'">查看全部 <span>→</span></button></div>
-                  <div v-if="!chamberDetails.jobs.length" class="small-empty">暂未配置定时任务。</div>
-                  <div v-else class="compact-job-list">
-                    <div v-for="job in chamberDetails.jobs.slice(0, 4)" :key="job.id" class="compact-job-row">
-                      <span class="job-state-dot" :class="{ paused: !job.enabled }"></span>
-                      <div><strong>{{ job.name }}</strong><span>{{ job.cron }}</span></div>
-                      <span class="state-text" :class="{ paused: !job.enabled }">{{ job.enabled ? '已启用' : '已暂停' }}</span>
-                    </div>
-                  </div>
-                </section>
-
-                <section class="content-card">
-                  <div class="content-card-heading"><div><h3>服务挂载</h3><p>HTTP 路由和本地目录</p></div><button class="inline-link" @click="chamberTab = 'mounts'">查看全部 <span>→</span></button></div>
-                  <div v-if="!chamberDetails.static_web.length && !chamberDetails.proxy_http.length" class="small-empty">暂未配置服务挂载。</div>
-                  <div v-else class="compact-mount-list">
-                    <div v-for="mount in chamberDetails.static_web.slice(0, 2)" :key="`static-${mount.route}`" class="compact-mount-row">
-                      <span class="mount-type-icon static-mount-icon">▤</span><div><strong>{{ mount.route }}</strong><span>静态目录</span></div><span class="mount-arrow">↗</span>
-                    </div>
-                    <div v-for="mount in chamberDetails.proxy_http.slice(0, 2)" :key="`proxy-${mount.route}`" class="compact-mount-row">
-                      <span class="mount-type-icon proxy-mount-icon">⇄</span><div><strong>{{ mount.route }}</strong><span>HTTP 代理</span></div><span class="mount-arrow">↗</span>
-                    </div>
-                  </div>
-                </section>
-              </div>
-            </div>
-
-            <div v-else-if="chamberTab === 'jobs'" class="detail-body">
-              <div class="tab-content-heading"><div><h3>定时任务</h3><p>查看任务配置，并即时暂停或恢复调度。</p></div><span class="count-pill">{{ chamberDetails.jobs.length }} 项</span></div>
+            <div v-if="chamberTab === 'jobs'" class="detail-body">
+              <div class="tab-content-heading"><div><h3>定时任务</h3></div><span class="count-pill">{{ chamberDetails.jobs.length }} 项</span></div>
               <div v-if="!chamberDetails.jobs.length" class="empty-card">这个 Chamber 还没有定时任务。</div>
               <div v-else class="table-wrap">
                 <table class="jobs-table">
@@ -627,24 +572,24 @@ onMounted(async () => {
             </div>
 
             <div v-else class="detail-body">
-              <div class="tab-content-heading"><div><h3>服务挂载</h3><p>Chamber 加载的静态目录和 HTTP 代理路由。</p></div><span class="count-pill">{{ chamberDetails.static_web.length + chamberDetails.proxy_http.length }} 项</span></div>
-              <div class="mount-groups">
-                <section class="mount-group">
-                  <div class="mount-group-heading"><span class="mount-type-icon static-mount-icon">▤</span><div><h4>静态目录</h4><p>直接从本地目录提供文件</p></div><span class="count-pill">{{ chamberDetails.static_web.length }}</span></div>
+              <div class="tab-content-heading"><div><h3>服务挂载</h3></div><span class="count-pill">{{ chamberDetails.static_web.length + chamberDetails.proxy_http.length }} 项</span></div>
+              <div v-if="!chamberDetails.static_web.length && !chamberDetails.proxy_http.length" class="empty-card">暂无服务挂载。</div>
+              <div v-else class="mount-groups">
+                <section v-if="chamberDetails.static_web.length" class="mount-group">
+                  <div class="mount-group-heading"><span class="mount-type-icon static-mount-icon">▤</span><div><h4>静态目录</h4></div><span class="count-pill">{{ chamberDetails.static_web.length }}</span></div>
                   <div v-if="!chamberDetails.static_web.length" class="small-empty">没有静态目录挂载。</div>
                   <div v-for="mount in chamberDetails.static_web" :key="mount.route" class="mount-card">
                     <div class="mount-route-line"><span class="route-method get-method">GET</span><strong>{{ mount.route }}</strong></div>
                     <p><span>目录</span><code>{{ mount.directory }}</code></p>
                   </div>
                 </section>
-                <section class="mount-group">
-                  <div class="mount-group-heading"><span class="mount-type-icon proxy-mount-icon">⇄</span><div><h4>HTTP 代理</h4><p>转发到本地服务</p></div><span class="count-pill">{{ chamberDetails.proxy_http.length }}</span></div>
+                <section v-if="chamberDetails.proxy_http.length" class="mount-group">
+                  <div class="mount-group-heading"><span class="mount-type-icon proxy-mount-icon">⇄</span><div><h4>HTTP 代理</h4></div><span class="count-pill">{{ chamberDetails.proxy_http.length }}</span></div>
                   <div v-if="!chamberDetails.proxy_http.length" class="small-empty">没有 HTTP 代理挂载。</div>
                   <div v-for="(mount, index) in chamberDetails.proxy_http" :key="mount.route" class="mount-card">
-                    <div class="mount-route-line"><span class="route-method proxy-method">PROXY</span><strong>{{ mount.route }}</strong></div>
+                    <div class="mount-route-line"><span class="route-method proxy-method">PROXY</span><strong>{{ mount.route }}</strong><button type="button" class="inline-link mount-logs-link" @click="openProxyLogs(mount, index)">查看日志</button></div>
                     <p><span>上游</span><code>{{ mount.upstream }}</code></p>
                     <p><span>工作目录</span><code>{{ mount.working_directory }}</code></p>
-                    <button type="button" class="inline-link" @click="openProxyLogs(mount, index)">查看日志</button>
                   </div>
                 </section>
               </div>
@@ -658,9 +603,8 @@ onMounted(async () => {
       <button type="button" class="inline-link proxy-logs-back" @click="closeProxyLogs">← 返回服务挂载</button>
       <div class="dashboard-heading">
         <div>
-          <p class="eyebrow">PROXY LOGS</p>
           <h1>代理日志</h1>
-          <p class="dashboard-subtitle">{{ proxyLogsChamber }} <span aria-hidden="true">/</span> {{ proxyLogsRoute }} · 进入页面时的日志快照</p>
+          <p class="dashboard-subtitle">{{ proxyLogsChamber }} <span aria-hidden="true">/</span> {{ proxyLogsRoute }}</p>
         </div>
         <span v-if="!proxyLogsLoading && !proxyLogsError" class="count-pill">{{ proxyLogs.length }} 条记录</span>
       </div>
@@ -678,13 +622,13 @@ onMounted(async () => {
 
     <main v-else class="dashboard-main account-main">
       <div class="dashboard-heading">
-        <div><p class="eyebrow">ADMIN PROFILE</p><h1>账户设置</h1><p class="dashboard-subtitle">当前登录账户：<strong>{{ currentUser }}</strong></p></div>
+        <div><h1>账户设置</h1><p class="dashboard-subtitle">当前登录账户：<strong>{{ currentUser }}</strong></p></div>
       </div>
       <p v-if="notice" class="dashboard-message notice-message" role="status">{{ notice }}</p>
       <p v-if="error" class="dashboard-message error-message" role="alert">{{ error }}</p>
       <div class="account-settings-grid">
         <section class="settings-card">
-          <div class="settings-card-heading"><span class="settings-icon">◎</span><div><h2>修改管理员用户名</h2><p>更新用于登录控制面板的账户名称。</p></div></div>
+          <div class="settings-card-heading"><span class="settings-icon">◎</span><div><h2>修改管理员用户名</h2></div></div>
           <form class="auth-form" @submit.prevent="changeUsername">
             <label for="new-username">新用户名</label>
             <input id="new-username" v-model.trim="newUsername" name="new-username" type="text" autocomplete="username" minlength="3" maxlength="32" required />
