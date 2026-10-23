@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use crate::chamber::{Chamber, ChamberManager};
-use crate::http::{Request, Response};
+use crate::http_types::{Request, Response};
 use crate::service::job::Job;
 use crate::service::job_service::JobServiceError;
 

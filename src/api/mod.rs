@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::chamber::ChamberManager;
-use crate::http::{Request, Response};
+use crate::http_types::{Request, Response};
 
 mod chambers;
 

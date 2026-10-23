@@ -5,21 +5,29 @@ use std::io;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
-use std::thread;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
+use axum::response::IntoResponse;
+use axum::routing::any;
 use rusqlite::Connection;
 use serde_json::json;
+use tower::limit::ConcurrencyLimitLayer;
 
-use crate::http::{Request, Response};
-use crate::{api, chamber::ChamberManager, http, migrations, proxy_http::ProxyMount, ui};
+use crate::http_types::{Request, Response};
+use crate::{api, chamber::ChamberManager, migrations, proxy_http::ProxyMount, ui};
 
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 53212;
 const DEFAULT_DATABASE_PATH: &str = "data/auth.sqlite3";
 const DEFAULT_CHAMBERS_DIR: &str = "./chamber";
+const MAX_REQUEST_BODY: usize = 2 * 1024 * 1024;
+const MAX_CONCURRENT_REQUESTS: usize = 32;
 
 static GLOBAL_APP: OnceLock<App> = OnceLock::new();
 static CTRL_C_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -40,6 +48,17 @@ pub struct App {
 struct MountRegistry {
     static_directories: Vec<StaticDirectory>,
     proxy_http: Vec<ProxyMount>,
+}
+
+#[derive(Clone)]
+struct HttpState {
+    app: App,
+    runtime: Arc<Mutex<RuntimeState>>,
+}
+
+struct RuntimeState {
+    database: Connection,
+    chambers: ChamberManager,
 }
 
 impl App {
@@ -234,11 +253,14 @@ pub fn run() -> io::Result<()> {
 fn run_server(app: &App) -> io::Result<()> {
     CTRL_C_REQUESTED.store(false, Ordering::Release);
     install_ctrl_c_handler()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
 
     let config = load_config()?;
-    let mut chambers = ChamberManager::load(&config.chambers_dir)
+    let chambers = ChamberManager::load(&config.chambers_dir)
         .map_err(|error| io::Error::other(format!("could not load Chambers: {error}")))?;
-    let mut database = initialize(&config)
+    let database = initialize(&config)
         .map_err(|error| io::Error::other(format!("could not initialize application: {error}")))?;
     let listener = TcpListener::bind((config.host.as_str(), config.port))?;
     listener.set_nonblocking(true)?;
@@ -284,68 +306,164 @@ fn run_server(app: &App) -> io::Result<()> {
     };
     println!("管理控制面板: http://{control_host}:{}/ui", address.port());
 
-    let server_result = (|| {
-        while !CTRL_C_REQUESTED.load(Ordering::Acquire) {
-            let (mut stream, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    eprintln!("HTTP connection error: {error}");
-                    continue;
-                }
-            };
+    let runtime_state = Arc::new(Mutex::new(RuntimeState { database, chambers }));
+    let router = http_router(HttpState {
+        app: app.clone(),
+        runtime: Arc::clone(&runtime_state),
+    });
+    let server_result = runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+    });
 
-            match http::read_request(&stream) {
-                Ok(Some(request)) => {
-                    let mounts = match app.mounts.read() {
-                        Ok(mounts) => {
-                            (mounts.static_directories.clone(), mounts.proxy_http.clone())
-                        }
-                        Err(_) => {
-                            eprintln!("Mount registry is unavailable");
-                            let response = Response::json(
-                                "500 Internal Server Error",
-                                json!({"error": "服务器内部错误。"}),
-                            );
-                            http::write_response(&mut stream, &response, request.method == "HEAD")?;
-                            continue;
-                        }
-                    };
-                    let response = handle_request(
-                        &request,
-                        &mut database,
-                        &mut chambers,
-                        app,
-                        &mounts.0,
-                        &mounts.1,
-                    );
-                    http::write_response(&mut stream, &response, request.method == "HEAD")?;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let response = if error.kind() == io::ErrorKind::FileTooLarge {
-                        Response::json("413 Payload Too Large", json!({"error": "请求内容过大。"}))
-                    } else {
-                        Response::json("400 Bad Request", json!({"error": "无法读取请求。"}))
-                    };
-                    http::write_response(&mut stream, &response, false)?;
+    match runtime_state.lock() {
+        Ok(state) => {
+            for chamber in state.chambers.chambers() {
+                if let Err(error) = chamber.close(app) {
+                    eprintln!("Could not close Chamber {}: {error}", chamber.name);
                 }
             }
         }
-        Ok(())
-    })();
-
-    for chamber in chambers.chambers() {
-        if let Err(error) = chamber.close(app) {
-            eprintln!("Could not close Chamber {}: {error}", chamber.name);
-        }
+        Err(_) => eprintln!("Could not close Chambers because server state is unavailable"),
     }
 
     server_result
+}
+
+fn http_router(state: HttpState) -> Router {
+    Router::new()
+        .route("/api", any(dispatch_request))
+        .route("/api/{*path}", any(dispatch_request))
+        .fallback(any(dispatch_request))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
+        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
+        .with_state(state)
+}
+
+async fn shutdown_signal() {
+    while !CTRL_C_REQUESTED.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn dispatch_request(
+    State(state): State<HttpState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> axum::response::Response {
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            let status = rejection.into_response().status();
+            let response = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                Response::json("413 Payload Too Large", json!({"error": "请求内容过大。"}))
+            } else {
+                Response::json("400 Bad Request", json!({"error": "无法读取请求。"}))
+            };
+            return to_framework_response(response, method == Method::HEAD);
+        }
+    };
+
+    let path = uri.path().to_owned();
+    let target = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(uri.path())
+        .to_owned();
+    let headers = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    let request = Request {
+        method: method.as_str().to_owned(),
+        target,
+        path,
+        headers,
+        body: body.to_vec(),
+    };
+    let app = state.app;
+    let runtime = state.runtime;
+
+    let response = tokio::task::spawn_blocking(move || {
+        let mut runtime = match runtime.lock() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return Response::json(
+                    "500 Internal Server Error",
+                    json!({"error": "服务器内部错误。"}),
+                );
+            }
+        };
+        let mounts = match app.mounts.read() {
+            Ok(mounts) => (mounts.static_directories.clone(), mounts.proxy_http.clone()),
+            Err(_) => {
+                eprintln!("Mount registry is unavailable");
+                return Response::json(
+                    "500 Internal Server Error",
+                    json!({"error": "服务器内部错误。"}),
+                );
+            }
+        };
+        let RuntimeState { database, chambers } = &mut *runtime;
+        handle_request(&request, database, chambers, &app, &mounts.0, &mounts.1)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        eprintln!("HTTP request handler failed: {error}");
+        Response::json(
+            "500 Internal Server Error",
+            json!({"error": "服务器内部错误。"}),
+        )
+    });
+
+    to_framework_response(response, method == Method::HEAD)
+}
+
+fn to_framework_response(response: Response, head_only: bool) -> axum::response::Response {
+    let status_code = response
+        .status
+        .split_ascii_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .and_then(|value| StatusCode::from_u16(value).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let content_length = response.content_length.unwrap_or(response.body.len());
+    let mut framework_response = axum::response::Response::new(if head_only {
+        axum::body::Body::empty()
+    } else {
+        axum::body::Body::from(response.body)
+    });
+    *framework_response.status_mut() = status_code;
+
+    let headers = framework_response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&response.content_type) {
+        headers.insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
+        headers.insert(axum::http::header::CONTENT_LENGTH, value);
+    }
+    for header in response.headers {
+        let Some((name, value)) = header.split_once(':') else {
+            continue;
+        };
+        let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.trim().as_bytes()),
+            HeaderValue::from_str(value.trim()),
+        ) else {
+            continue;
+        };
+        headers.append(name, value);
+    }
+    framework_response
 }
 
 fn install_ctrl_c_handler() -> io::Result<()> {

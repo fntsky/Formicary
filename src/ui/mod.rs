@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::http::Response;
+use crate::http_types::Response;
 
 pub fn is_ui_path(path: &str) -> bool {
     path == "/ui" || path.starts_with("/ui/")
