@@ -190,14 +190,14 @@ fn parse_branches(output: &str) -> Result<Branches, String> {
     let mut branches = Vec::new();
     let mut default_branch = None;
     for line in output.lines() {
-        if let Some((reference, "HEAD")) = line.split_once('\t') {
-            if let Some(name) = reference.strip_prefix("ref: refs/heads/") {
-                default_branch = Some(name.to_owned());
-            }
-        } else if let Some((_, reference)) = line.split_once('\t') {
-            if let Some(name) = reference.strip_prefix("refs/heads/") {
-                branches.push(name.to_owned());
-            }
+        if let Some((reference, "HEAD")) = line.split_once('\t')
+            && let Some(name) = reference.strip_prefix("ref: refs/heads/")
+        {
+            default_branch = Some(name.to_owned());
+        } else if let Some((_, reference)) = line.split_once('\t')
+            && let Some(name) = reference.strip_prefix("refs/heads/")
+        {
+            branches.push(name.to_owned());
         }
     }
     branches.sort();

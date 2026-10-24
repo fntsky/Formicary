@@ -20,7 +20,14 @@ use serde_json::json;
 use tower::limit::ConcurrencyLimitLayer;
 
 use crate::http_types::{Request, Response};
-use crate::{api, chamber::ChamberManager, migrations, proxy_http::ProxyMount, ui};
+use crate::{
+    api,
+    auth::{KeyAuthentication, authenticate_key},
+    chamber::ChamberManager,
+    migrations,
+    proxy_http::{ProxyIdentity, ProxyMount},
+    ui,
+};
 
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 53212;
@@ -500,15 +507,28 @@ pub fn initialize(config: &Config) -> Result<Connection, Box<dyn Error>> {
     migrations::migrate(&mut database)?;
     api::cleanup_expired_sessions(&database)?;
 
-    if !database_existed || api::user_count(&database)? == 0 {
-        if let Some((username, password)) = api::create_initial_account(&mut database)? {
-            println!("首次启动已创建管理员账户：");
-            println!("用户名: {username}");
-            println!("密码: {password}");
-        }
+    if (!database_existed || api::user_count(&database)? == 0)
+        && let Some((username, password)) = api::create_initial_account(&mut database)?
+    {
+        println!("首次启动已创建管理员账户：");
+        println!("用户名: {username}");
+        println!("密码: {password}");
     }
 
     Ok(database)
+}
+
+fn proxy_invalid_key_response() -> Response {
+    let mut response = Response::new(
+        "401 Unauthorized",
+        "text/plain; charset=utf-8",
+        b"Invalid API key\n".to_vec(),
+    );
+    response
+        .headers
+        .push("WWW-Authenticate: Bearer realm=\"formicary\"".into());
+    response.headers.push("Cache-Control: no-store".into());
+    response
 }
 
 fn handle_request(
@@ -556,19 +576,33 @@ fn handle_request(
     };
     if let Some(route) = route {
         return match route {
-            Route::Proxy(mount) => {
-                let username = match api::authenticated_username(request, database) {
-                    Ok(username) => username,
-                    Err(error) => {
-                        eprintln!("Could not validate proxy request session: {error}");
-                        return Response::json(
-                            "500 Internal Server Error",
-                            json!({"error": "服务器内部错误。"}),
-                        );
-                    }
-                };
-                mount.forward(request, username.as_deref())
-            }
+            Route::Proxy(mount) => match authenticate_key(request, database) {
+                Ok(KeyAuthentication::Valid(identity)) => {
+                    mount.forward(request, Some(&ProxyIdentity::api_key(&identity)))
+                }
+                Ok(KeyAuthentication::Invalid) => proxy_invalid_key_response(),
+                Ok(KeyAuthentication::Absent) => {
+                    let username = match api::authenticated_username(request, database) {
+                        Ok(username) => username,
+                        Err(error) => {
+                            eprintln!("Could not validate proxy request session: {error}");
+                            return Response::json(
+                                "500 Internal Server Error",
+                                json!({"error": "服务器内部错误。"}),
+                            );
+                        }
+                    };
+                    let identity = username.map(ProxyIdentity::session);
+                    mount.forward(request, identity.as_ref())
+                }
+                Err(error) => {
+                    eprintln!("Could not validate proxy request API key: {error}");
+                    Response::json(
+                        "500 Internal Server Error",
+                        json!({"error": "服务器内部错误。"}),
+                    )
+                }
+            },
             Route::Static(mount) if request.method == "GET" || request.method == "HEAD" => {
                 let relative_path = request
                     .path

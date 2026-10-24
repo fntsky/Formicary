@@ -8,6 +8,7 @@ use crate::chamber::ChamberManager;
 use crate::http_types::{Request, Response};
 
 mod chambers;
+mod keys;
 
 const SESSION_TTL_SECONDS: u64 = 60 * 60 * 24;
 const SESSION_COOKIE: &str = "formicary_session";
@@ -81,6 +82,7 @@ pub fn handle(
                 "endpoints": [
                     "/api/login",
                     "/api/me",
+                    "/api/keys",
                     "/api/logout",
                     "/api/admin/username",
                     "/api/admin/password",
@@ -99,6 +101,7 @@ pub fn handle(
         ("POST", "/api/logout") => logout(request, database),
         ("POST", "/api/admin/username") => change_username(request, database),
         ("POST", "/api/admin/password") => change_password(request, database),
+        _ if keys::matches_path(&request.path) => keys::handle(request, database),
         _ if chambers::matches_path(&request.path) => {
             chambers::handle(request, database, chambers, app)
         }
@@ -152,6 +155,26 @@ fn login(request: &Request, database: &Connection) -> rusqlite::Result<Response>
 }
 
 fn current_user(request: &Request, database: &Connection) -> rusqlite::Result<Response> {
+    match crate::auth::authenticate_key(request, database)? {
+        crate::auth::KeyAuthentication::Valid(key) => {
+            return Ok(no_store(Response::json(
+                "200 OK",
+                json!({
+                    "authenticated": true,
+                    "username": key.username,
+                    "auth": "api_key",
+                    "key": {
+                        "id": key.id,
+                        "name": key.name,
+                        "key_id": key.key_id,
+                    },
+                }),
+            )));
+        }
+        crate::auth::KeyAuthentication::Invalid => return Ok(invalid_key_response()),
+        crate::auth::KeyAuthentication::Absent => {}
+    }
+
     let Some(token) = session_token(request) else {
         return Ok(unauthorized_response());
     };
@@ -166,12 +189,28 @@ fn current_user(request: &Request, database: &Connection) -> rusqlite::Result<Re
         .optional()?;
 
     match user {
-        Some(username) => Ok(Response::json(
+        Some(username) => Ok(no_store(Response::json(
             "200 OK",
-            json!({"authenticated": true, "username": username}),
-        )),
+            json!({"authenticated": true, "username": username, "auth": "session"}),
+        ))),
         None => Ok(unauthorized_response()),
     }
+}
+
+fn invalid_key_response() -> Response {
+    let mut response = Response::json(
+        "401 Unauthorized",
+        json!({"error": "密钥无效或已撤销。", "code": "invalid_api_key"}),
+    );
+    response
+        .headers
+        .push("WWW-Authenticate: Bearer realm=\"formicary\"".into());
+    no_store(response)
+}
+
+fn no_store(mut response: Response) -> Response {
+    response.headers.push("Cache-Control: no-store".into());
+    response
 }
 
 fn change_username(request: &Request, database: &Connection) -> rusqlite::Result<Response> {
@@ -289,7 +328,7 @@ pub fn authenticated_username(
         .optional()
 }
 
-fn verify_current_password(
+pub(super) fn verify_current_password(
     database: &Connection,
     user_id: i64,
     current_password: &str,
@@ -349,7 +388,9 @@ fn parse_credentials(request: &Request) -> Result<Credentials, Response> {
     parse_json_body(request)
 }
 
-fn parse_json_body<T: for<'de> Deserialize<'de>>(request: &Request) -> Result<T, Response> {
+pub(super) fn parse_json_body<T: for<'de> Deserialize<'de>>(
+    request: &Request,
+) -> Result<T, Response> {
     if request.body.is_empty() {
         return Err(Response::json(
             "400 Bad Request",

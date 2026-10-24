@@ -25,6 +25,24 @@ const refreshing = ref(false)
 const busyJob = ref(null)
 let chamberRequestId = 0
 
+const keys = ref([])
+const loadingKeys = ref(false)
+const keysError = ref('')
+const keysNotice = ref('')
+const createKeyDialog = ref(null)
+const createKeyButton = ref(null)
+const createKeyName = ref('')
+const createKeyPassword = ref('')
+const createKeyError = ref('')
+const creatingKey = ref(false)
+const createdKey = ref(null)
+const createdKeyDialog = ref(null)
+const copyKeyStatus = ref('')
+const revokeKeyDialog = ref(null)
+const revokeKeyTarget = ref(null)
+const revokeKeyError = ref('')
+const revokingKey = ref(false)
+
 const totalJobs = computed(() => chambers.value.reduce((total, chamber) => total + chamber.job_count, 0))
 const enabledJobs = computed(() => chambers.value.reduce((total, chamber) => total + chamber.enabled_job_count, 0))
 const totalMounts = computed(() => chambers.value.reduce(
@@ -334,6 +352,9 @@ async function logout() {
     chambers.value = []
     chamberDetails.value = null
     selectedChamber.value = ''
+    keys.value = []
+    createdKey.value = null
+    createKeyPassword.value = ''
   } catch (requestError) {
     error.value = requestError.message
   } finally {
@@ -350,6 +371,129 @@ function formatTimeout(timeoutMs) {
   }
   return `${Math.round(timeoutMs / 1000)} 秒`
 }
+
+async function loadKeys() {
+  loadingKeys.value = true
+  keysError.value = ''
+  try {
+    const data = await requestJson('/api/keys', { cache: 'no-store' })
+    keys.value = data.keys || []
+  } catch (requestError) {
+    keysError.value = requestError.message
+  } finally {
+    loadingKeys.value = false
+  }
+}
+
+function openCreateKeyDialog() {
+  createKeyError.value = ''
+  keysNotice.value = ''
+  createKeyName.value = ''
+  createKeyPassword.value = ''
+  createKeyDialog.value?.showModal()
+}
+
+function closeCreateKeyDialog() {
+  if (creatingKey.value) return
+  createKeyPassword.value = ''
+  createKeyDialog.value?.close()
+  createKeyButton.value?.focus()
+}
+
+async function createKey() {
+  if (creatingKey.value) return
+  creatingKey.value = true
+  createKeyError.value = ''
+  keysNotice.value = ''
+  try {
+    const data = await postJson('/api/keys', {
+      name: createKeyName.value,
+      current_password: createKeyPassword.value,
+    })
+    createKeyPassword.value = ''
+    createKeyDialog.value?.close()
+    createdKey.value = data
+    copyKeyStatus.value = ''
+    createdKeyDialog.value?.showModal()
+    await loadKeys()
+  } catch (requestError) {
+    createKeyError.value = requestError.message
+  } finally {
+    creatingKey.value = false
+  }
+}
+
+async function copyCreatedKey() {
+  if (!createdKey.value) return
+  try {
+    await navigator.clipboard.writeText(createdKey.value.token)
+    copyKeyStatus.value = '已复制到剪贴板。'
+  } catch {
+    copyKeyStatus.value = '复制失败，请手动选择密钥文本。'
+  }
+}
+
+function closeCreatedKey() {
+  createdKey.value = null
+  copyKeyStatus.value = ''
+  createdKeyDialog.value?.close()
+}
+
+function openRevokeKeyDialog(key) {
+  revokeKeyError.value = ''
+  keysNotice.value = ''
+  revokeKeyTarget.value = key
+  revokeKeyDialog.value?.showModal()
+}
+
+function closeRevokeKeyDialog() {
+  if (revokingKey.value) return
+  revokeKeyTarget.value = null
+  revokeKeyDialog.value?.close()
+}
+
+async function revokeKey() {
+  if (!revokeKeyTarget.value || revokingKey.value) return
+  revokingKey.value = true
+  revokeKeyError.value = ''
+  keysNotice.value = ''
+  const key = revokeKeyTarget.value
+  try {
+    await requestJson(`/api/keys/${key.id}`, { method: 'DELETE' })
+    revokeKeyDialog.value?.close()
+    revokeKeyTarget.value = null
+    keysNotice.value = `密钥 ${key.name} 已撤销。`
+    await loadKeys()
+  } catch (requestError) {
+    revokeKeyError.value = requestError.message
+  } finally {
+    revokingKey.value = false
+  }
+}
+
+function formatDateTime(value) {
+  if (!value) return '—'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime())
+    ? '—'
+    : date.toLocaleString('zh-CN', { hour12: false })
+}
+
+function formatLastUsed(value) {
+  return value ? formatDateTime(value) : '从未使用'
+}
+
+function maskKeyId(keyId) {
+  return keyId ? `fmk_${keyId.slice(0, 8)}…` : '—'
+}
+
+function keyStatusLabel(status) {
+  return status === 'revoked' ? '已撤销' : '有效'
+}
+
+watch(activePage, (page) => {
+  if (page === 'keys' && currentUser.value) loadKeys()
+})
 
 onMounted(async () => {
   try {
@@ -374,6 +518,7 @@ onMounted(async () => {
       <template v-if="currentUser">
         <nav class="topbar-nav" aria-label="管理页面">
           <button :class="{ selected: activePage === 'chambers' || activePage === 'proxy-logs' }" @click="activePage = 'chambers'">服务管理</button>
+          <button :class="{ selected: activePage === 'keys' }" @click="activePage = 'keys'">API 密钥</button>
           <button :class="{ selected: activePage === 'account' }" @click="activePage = 'account'">账户设置</button>
         </nav>
         <div class="topbar-user"><span class="user-avatar">{{ currentUser.slice(0, 1).toUpperCase() }}</span>{{ currentUser }}</div>
@@ -618,6 +763,92 @@ onMounted(async () => {
           <time class="proxy-log-time" :datetime="entry.timestamp">{{ entry.time }}</time>
         </div>
       </div>
+    </main>
+
+    <main v-else-if="activePage === 'keys'" class="dashboard-main keys-page">
+      <div class="dashboard-heading">
+        <div>
+          <h1>API 密钥</h1>
+          <p class="dashboard-subtitle">用于 Chamber 代理服务的密钥认证。密钥只显示一次，请妥善保存。</p>
+        </div>
+        <button ref="createKeyButton" class="primary-button import-trigger" type="button" @click="openCreateKeyDialog">＋ 创建密钥</button>
+      </div>
+
+      <p class="key-warning">
+        所有密钥都会被所有 Chamber 代理识别为有效身份，且永不过期。Chamber 通过
+        <code>X-Formicary-Auth</code> 判断请求是否携带有效密钥，并自行决定哪些接口需要密钥。
+      </p>
+
+      <p v-if="keysError" class="dashboard-message error-message" role="alert">{{ keysError }}</p>
+      <p v-if="keysNotice" class="dashboard-message notice-message" role="status">{{ keysNotice }}</p>
+
+      <p v-if="loadingKeys" class="panel-empty" role="status">正在读取密钥…</p>
+      <p v-else-if="!keys.length" class="panel-empty">还没有 API 密钥。创建后可用于访问需要密钥的 Chamber 代理接口。</p>
+      <div v-else class="table-wrap">
+        <table class="jobs-table keys-table">
+          <thead>
+            <tr><th>名称</th><th>密钥</th><th>创建时间</th><th>最近使用</th><th>状态</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="key in keys" :key="key.id">
+              <td><strong>{{ key.name }}</strong><small>#{{ key.id }}</small></td>
+              <td><code class="key-prefix">{{ maskKeyId(key.key_id) }}</code></td>
+              <td class="muted-cell">{{ formatDateTime(key.created_at) }}</td>
+              <td class="muted-cell">{{ formatLastUsed(key.last_used_at) }}</td>
+              <td><span class="job-status" :class="{ paused: key.status === 'revoked' }"><i></i>{{ keyStatusLabel(key.status) }}</span></td>
+              <td>
+                <button v-if="key.status !== 'revoked'" class="job-action" type="button" @click="openRevokeKeyDialog(key)">撤销</button>
+                <span v-else class="muted-cell">—</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <dialog ref="createKeyDialog" class="import-dialog key-dialog" aria-labelledby="create-key-title" @cancel.prevent="closeCreateKeyDialog" @click="($event.target === createKeyDialog) && closeCreateKeyDialog()">
+        <div class="import-dialog-heading">
+          <div><p class="eyebrow">CREATE API KEY</p><h2 id="create-key-title">创建密钥</h2></div>
+          <button class="dialog-close" type="button" aria-label="关闭创建密钥弹窗" :disabled="creatingKey" @click="closeCreateKeyDialog">×</button>
+        </div>
+        <p>密钥用于 Chamber 代理服务的认证。没有作用域和过期时间，任何有效密钥都可以被所有 Chamber 使用。</p>
+        <form class="auth-form" @submit.prevent="createKey">
+          <label for="key-name">名称</label>
+          <input id="key-name" v-model.trim="createKeyName" name="key-name" type="text" maxlength="64" required autofocus placeholder="例如：blog-ci" />
+          <label for="key-password">当前密码</label>
+          <input id="key-password" v-model="createKeyPassword" name="key-password" type="password" autocomplete="current-password" maxlength="128" required />
+          <p v-if="createKeyError" class="error-message" role="alert">{{ createKeyError }}</p>
+          <div class="import-dialog-actions">
+            <button class="refresh-button" type="button" :disabled="creatingKey" @click="closeCreateKeyDialog">取消</button>
+            <button class="primary-button" type="submit" :disabled="creatingKey">{{ creatingKey ? '正在创建…' : '创建密钥' }}</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog ref="createdKeyDialog" class="import-dialog key-dialog" aria-labelledby="created-key-title" @cancel.prevent>
+        <div class="import-dialog-heading">
+          <div><p class="eyebrow">KEY CREATED</p><h2 id="created-key-title">密钥已创建</h2></div>
+        </div>
+        <p>这是唯一一次显示完整密钥。关闭后无法再次查看，请立即保存。</p>
+        <p v-if="createdKey" class="key-secret">{{ createdKey.token }}</p>
+        <p v-if="copyKeyStatus" class="notice-message" role="status">{{ copyKeyStatus }}</p>
+        <div class="import-dialog-actions">
+          <button class="refresh-button" type="button" @click="copyCreatedKey">复制密钥</button>
+          <button class="primary-button" type="button" @click="closeCreatedKey">我已保存，关闭</button>
+        </div>
+      </dialog>
+
+      <dialog ref="revokeKeyDialog" class="import-dialog key-dialog" aria-labelledby="revoke-key-title" @cancel.prevent="closeRevokeKeyDialog" @click="($event.target === revokeKeyDialog) && closeRevokeKeyDialog()">
+        <div class="import-dialog-heading">
+          <div><p class="eyebrow">REVOKE KEY</p><h2 id="revoke-key-title">撤销密钥</h2></div>
+          <button class="dialog-close" type="button" aria-label="关闭撤销弹窗" :disabled="revokingKey" @click="closeRevokeKeyDialog">×</button>
+        </div>
+        <p>确定撤销 <strong>{{ revokeKeyTarget?.name }}</strong>？撤销后使用该密钥的代理请求会立即收到 401，且无法恢复。</p>
+        <p v-if="revokeKeyError" class="error-message" role="alert">{{ revokeKeyError }}</p>
+        <div class="import-dialog-actions">
+          <button class="refresh-button" type="button" :disabled="revokingKey" @click="closeRevokeKeyDialog">取消</button>
+          <button class="danger-button" type="button" :disabled="revokingKey" @click="revokeKey">{{ revokingKey ? '正在撤销…' : '确认撤销' }}</button>
+        </div>
+      </dialog>
     </main>
 
     <main v-else class="dashboard-main account-main">

@@ -166,7 +166,7 @@ impl ChamberManager {
                 continue;
             }
             let entry_type = entry.file_type().map_err(|error| {
-                manager_io_error(&entry.path(), "could not inspect directory entry", error)
+                manager_io_error(entry.path(), "could not inspect directory entry", error)
             })?;
             if !entry_type.is_dir() {
                 continue;

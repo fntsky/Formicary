@@ -22,6 +22,52 @@ struct Upstream {
     base_path: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProxyAuth {
+    Session,
+    ApiKey,
+}
+
+/// Verified identity forwarded to a trusted local Chamber service.
+#[derive(Clone, Debug)]
+pub(crate) struct ProxyIdentity {
+    pub(crate) username: String,
+    pub(crate) auth: ProxyAuth,
+    pub(crate) key_id: Option<String>,
+}
+
+impl ProxyIdentity {
+    pub(crate) fn session(username: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            auth: ProxyAuth::Session,
+            key_id: None,
+        }
+    }
+
+    pub(crate) fn api_key(identity: &crate::auth::ApiKeyIdentity) -> Self {
+        Self {
+            username: identity.username.clone(),
+            auth: ProxyAuth::ApiKey,
+            key_id: Some(identity.key_id.clone()),
+        }
+    }
+
+    fn auth_name(&self) -> &'static str {
+        match self.auth {
+            ProxyAuth::Session => "session",
+            ProxyAuth::ApiKey => "api_key",
+        }
+    }
+
+    fn principal(&self) -> String {
+        match (&self.auth, &self.key_id) {
+            (ProxyAuth::ApiKey, Some(key_id)) => format!("api-key:{key_id}"),
+            _ => self.username.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProxyMount {
     pub(crate) route: String,
@@ -71,12 +117,8 @@ impl ProxyMount {
                 .is_some_and(|suffix| suffix.starts_with('/'))
     }
 
-    pub(crate) fn forward(
-        &self,
-        request: &Request,
-        authenticated_username: Option<&str>,
-    ) -> Response {
-        match self.try_forward(request, authenticated_username) {
+    pub(crate) fn forward(&self, request: &Request, identity: Option<&ProxyIdentity>) -> Response {
+        match self.try_forward(request, identity) {
             Ok(response) => response,
             Err(error) => {
                 let (status, message) = if matches!(
@@ -103,7 +145,7 @@ impl ProxyMount {
     fn try_forward(
         &self,
         request: &Request,
-        authenticated_username: Option<&str>,
+        identity: Option<&ProxyIdentity>,
     ) -> io::Result<Response> {
         if self.shell().is_finished() {
             return Err(io::Error::new(
@@ -123,21 +165,41 @@ impl ProxyMount {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let mut builder = client.request(method, url).header(CONNECTION, "close");
 
-        if let Some(username) = authenticated_username.filter(|value| !value.contains(['\r', '\n']))
+        if let Some(identity) = identity
+            && !identity.username.contains(['\r', '\n'])
         {
-            builder = builder.header("X-Formicary-User", username);
+            let principal = identity.principal();
+            builder = builder
+                .header("X-Formicary-User", identity.username.as_str())
+                .header("X-Formicary-Auth", identity.auth_name())
+                .header("X-Formicary-Principal", principal.as_str());
+            if let Some(key_id) = &identity.key_id {
+                builder = builder.header("X-Formicary-Key-Id", key_id.as_str());
+            }
         }
+        let strip_session_cookie =
+            identity.is_some_and(|identity| identity.auth == ProxyAuth::ApiKey);
         let connection_headers = connection_header_tokens(&request.headers);
         for (name, value) in &request.headers {
-            if name == "x-formicary-user"
+            if name.starts_with("x-formicary-")
+                || name == "x-api-key"
+                || (name == "authorization" && is_formicary_bearer(value))
                 || is_hop_by_hop(name)
                 || connection_headers.contains(name)
             {
                 continue;
             }
+            let forwarded_value = if name == "cookie" && strip_session_cookie {
+                let Some(cookie) = strip_formicary_session_cookie(value) else {
+                    continue;
+                };
+                cookie
+            } else {
+                value.clone()
+            };
             let (Ok(name), Ok(value)) = (
                 HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(value),
+                HeaderValue::from_str(&forwarded_value),
             ) else {
                 continue;
             };
@@ -314,6 +376,30 @@ fn read_upstream_response(
     Ok(response)
 }
 
+fn is_formicary_bearer(value: &str) -> bool {
+    value.split_once(' ').is_some_and(|(scheme, token)| {
+        scheme.eq_ignore_ascii_case("bearer") && token.trim().starts_with("fmk_")
+    })
+}
+
+fn strip_formicary_session_cookie(value: &str) -> Option<String> {
+    let mut cookies = Vec::new();
+    for cookie in value.split(';') {
+        let cookie = cookie.trim();
+        if cookie.is_empty() {
+            continue;
+        }
+        let name = cookie
+            .split_once('=')
+            .map_or(cookie, |(name, _)| name.trim());
+        if name == "formicary_session" {
+            continue;
+        }
+        cookies.push(cookie);
+    }
+    (!cookies.is_empty()).then(|| cookies.join("; "))
+}
+
 fn connection_header_tokens(headers: &std::collections::HashMap<String, String>) -> Vec<String> {
     headers
         .get("connection")
@@ -448,5 +534,91 @@ mod tests {
         drop(clone);
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod identity_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn forwards_verified_identity_and_strips_key_material() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            String::from_utf8_lossy(&buffer).into_owned()
+        });
+
+        let mount = ProxyMount::start(
+            Path::new("."),
+            "exec sleep 30",
+            "/test".into(),
+            &format!("http://{address}"),
+        )
+        .unwrap();
+        let identity = crate::auth::ApiKeyIdentity {
+            id: 1,
+            username: "admin".into(),
+            name: "ci".into(),
+            key_id: "0123456789abcdef01234567".into(),
+        };
+        let request = Request {
+            method: "GET".into(),
+            target: "/test/hello?x=1".into(),
+            path: "/test/hello".into(),
+            headers: HashMap::from([
+                (
+                    "authorization".into(),
+                    "Bearer fmk_0123456789abcdef01234567_secret".into(),
+                ),
+                ("x-api-key".into(), "should-not-forward".into()),
+                ("x-formicary-user".into(), "spoofed".into()),
+                (
+                    "cookie".into(),
+                    "first=1; formicary_session=secret; second=2".into(),
+                ),
+            ]),
+            body: Vec::new(),
+        };
+
+        let response = mount.forward(&request, Some(&ProxyIdentity::api_key(&identity)));
+        assert_eq!(response.status, "200 OK");
+        let captured = upstream.join().unwrap();
+        let lower = captured.to_ascii_lowercase();
+
+        assert!(lower.contains("x-formicary-user: admin"));
+        assert!(lower.contains("x-formicary-auth: api_key"));
+        assert!(lower.contains("x-formicary-principal: api-key:0123456789abcdef01234567"));
+        assert!(lower.contains("x-formicary-key-id: 0123456789abcdef01234567"));
+        assert!(lower.contains("cookie: first=1; second=2"));
+        assert!(!lower.contains("fmk_"));
+        assert!(!lower.contains("x-api-key"));
+        assert!(!lower.contains("formicary_session"));
+        assert!(!lower.contains("x-formicary-user: spoofed"));
+        assert!(captured.starts_with("GET /hello?x=1 HTTP/1.1"));
+
+        mount.shell().terminate();
     }
 }

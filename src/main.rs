@@ -1,5 +1,6 @@
 mod api;
 pub mod app;
+mod auth;
 pub mod chamber;
 mod http_types;
 mod migrations;
