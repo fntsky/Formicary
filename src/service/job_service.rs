@@ -239,6 +239,35 @@ impl JobService {
         }
     }
 
+    pub fn remove_job(&self, id: u64) {
+        let managed = self
+            .jobs
+            .lock()
+            .expect("job service lock poisoned")
+            .remove(&id);
+        if let Some(mut managed) = managed {
+            let (state, wake) = &*managed.control;
+            {
+                let mut state = state.lock().expect("job state lock poisoned");
+                state.stopped = true;
+                state.job.set_enabled(false);
+                state.job.terminate_shell();
+                wake.notify_one();
+            }
+            if let Some(worker) = managed.worker.take() {
+                while !worker.is_finished() {
+                    state
+                        .lock()
+                        .expect("job state lock poisoned")
+                        .job
+                        .terminate_shell();
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let _ = worker.join();
+            }
+        }
+    }
+
     fn set_job_enabled(&self, id: u64, enabled: bool) -> Result<Job, JobServiceError> {
         let jobs = self.jobs.lock().expect("job service lock poisoned");
         let managed = jobs.get(&id).ok_or(JobServiceError::NotFound(id))?;

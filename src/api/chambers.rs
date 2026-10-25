@@ -83,6 +83,7 @@ fn list_chambers(
             json!({
                 "name": chamber.name,
                 "directory": chamber.directory.display().to_string(),
+                "stopped": chambers.stopped(&chamber.name),
                 "job_count": jobs.len(),
                 "enabled_job_count": jobs.iter().filter(|job| job.snapshot().enabled).count(),
                 "static_web_count": chamber.static_web_mounts().len(),
@@ -114,9 +115,42 @@ fn list_jobs(
 fn chamber_route(
     request: &Request,
     database: &Connection,
-    chambers: &ChamberManager,
+    chambers: &mut ChamberManager,
     app: &crate::app::App,
 ) -> rusqlite::Result<Response> {
+    let parts = request.path.split('/').collect::<Vec<_>>();
+    if let ["", "api", "chambers", encoded_name, rest @ ..] = parts.as_slice() {
+        if request.method != "GET" {
+            if authenticated_user_id(request, database)?.is_none() {
+                return Ok(unauthorized_response());
+            }
+            let Some(name) = decode_path_segment(encoded_name) else {
+                return Ok(invalid_chamber_name_response());
+            };
+            if !chambers.chambers().iter().any(|c| c.name == name) {
+                return Ok(not_found_response());
+            }
+            let result = match (request.method.as_str(), rest) {
+                ("POST", ["stop"]) => chambers.stop(&name, app),
+                ("POST", ["start"]) => chambers.start(&name, app),
+                ("DELETE", []) => chambers.delete(&name, app),
+                ("DELETE", ["releases", commit]) => chambers.delete_release(&name, commit),
+                ("POST", ["upgrade"]) => {
+                    let input: crate::chamber::github::Download =
+                        match super::parse_json_body(request) {
+                            Ok(v) => v,
+                            Err(r) => return Ok(r),
+                        };
+                    chambers.install(&input, Some(&name), app).map(|_| ())
+                }
+                _ => return Ok(method_not_allowed_response()),
+            };
+            return Ok(match result {
+                Ok(()) => Response::json("200 OK", json!({"ok": true})),
+                Err(error) => Response::json("400 Bad Request", json!({"error": error})),
+            });
+        }
+    }
     let segments = request.path.split('/').collect::<Vec<_>>();
     match segments.as_slice() {
         [
@@ -189,7 +223,13 @@ fn chamber_route(
             };
             Ok(Response::json(
                 "200 OK",
-                json!({"chamber": chamber_json(chamber)}),
+                json!({"chamber": ({
+                    let mut value = chamber_json(chamber);
+                    value["stopped"] = json!(chambers.stopped(&name));
+                    value["releases"] = json!(chambers.releases(&name));
+                    value["current_commit"] = json!(chamber.directory.file_name().and_then(|s| s.to_str()));
+                    value
+                })}),
             ))
         }
         ["", "api", "chambers", encoded_name, "jobs"] => {
@@ -388,7 +428,7 @@ mod tests {
             std::env::temp_dir().join(format!("formicary-proxy-logs-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("test")).unwrap();
         fs::write(root.join("test/chamber.toml"), "[chamber]\nname = 'test'\nschema_version = 1\n[proxyhttp]\nscript = 'printf hello'\nroute = '/logs-test'\nupstream = 'http://127.0.0.1:1'\n").unwrap();
-        let manager = ChamberManager::load(&root).unwrap();
+        let mut manager = ChamberManager::load(&root).unwrap();
         let app = crate::app::App::new();
         app.register_proxy_http(
             root.join("test"),
@@ -418,7 +458,7 @@ mod tests {
             body: Vec::new(),
         };
         assert_eq!(
-            chamber_route(&request, &database, &manager, &app)
+            chamber_route(&request, &database, &mut manager, &app)
                 .unwrap()
                 .status,
             "401 Unauthorized"
@@ -426,7 +466,7 @@ mod tests {
         request
             .headers
             .insert("cookie".into(), "formicary_session=test-token".into());
-        let response = chamber_route(&request, &database, &manager, &app).unwrap();
+        let response = chamber_route(&request, &database, &mut manager, &app).unwrap();
         assert_eq!(response.status, "200 OK");
         assert!(
             response
@@ -459,7 +499,7 @@ mod tests {
         }
         request.path = "/api/chambers/test/proxies/1/logs".into();
         assert_eq!(
-            chamber_route(&request, &database, &manager, &app)
+            chamber_route(&request, &database, &mut manager, &app)
                 .unwrap()
                 .status,
             "404 Not Found"

@@ -22,6 +22,7 @@ pub struct ProxyHttpMount {
     pub working_directory: PathBuf,
     pub script: String,
     pub upstream: String,
+    pub health_path: Option<String>,
     pub route: String,
     pub config_path: PathBuf,
 }
@@ -157,6 +158,14 @@ impl Chamber {
             Ok(())
         } else {
             Err(JobServiceError::NotFound(id))
+        }
+    }
+}
+
+impl Drop for Chamber {
+    fn drop(&mut self) {
+        for job in self.jobs() {
+            self.job_service.remove_job(job.id());
         }
     }
 }

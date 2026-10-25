@@ -61,6 +61,7 @@ struct MountRegistry {
 struct HttpState {
     app: App,
     runtime: Arc<Mutex<RuntimeState>>,
+    database_path: PathBuf,
 }
 
 struct RuntimeState {
@@ -317,6 +318,7 @@ fn run_server(app: &App) -> io::Result<()> {
     let router = http_router(HttpState {
         app: app.clone(),
         runtime: Arc::clone(&runtime_state),
+        database_path: config.database_path.clone(),
     });
     let server_result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -399,8 +401,33 @@ async fn dispatch_request(
     };
     let app = state.app;
     let runtime = state.runtime;
+    let database_path = state.database_path;
 
     let response = tokio::task::spawn_blocking(move || {
+        if !api::is_api_path(&request.path) {
+            let mounts = match app.mounts.read() {
+                Ok(m) => (m.static_directories.clone(), m.proxy_http.clone()),
+                Err(_) => {
+                    return Response::json(
+                        "500 Internal Server Error",
+                        json!({"error": "挂载不可用"}),
+                    );
+                }
+            };
+            let database = match Connection::open_with_flags(
+                &database_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                Ok(db) => db,
+                Err(_) => {
+                    return Response::json(
+                        "500 Internal Server Error",
+                        json!({"error": "认证数据库不可用"}),
+                    );
+                }
+            };
+            return handle_mounted_request(&request, &database, &mounts.0, &mounts.1);
+        }
         let mut runtime = match runtime.lock() {
             Ok(runtime) => runtime,
             Err(_) => {
@@ -552,6 +579,15 @@ fn handle_request(
         };
     }
 
+    handle_mounted_request(request, database, static_directories, proxy_http)
+}
+
+fn handle_mounted_request(
+    request: &Request,
+    database: &Connection,
+    static_directories: &[StaticDirectory],
+    proxy_http: &[ProxyMount],
+) -> Response {
     enum Route<'a> {
         Static(&'a StaticDirectory),
         Proxy(&'a ProxyMount),

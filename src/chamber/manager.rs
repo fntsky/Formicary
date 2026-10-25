@@ -57,6 +57,8 @@ struct ChamberFile {
 struct ChamberHeader {
     name: String,
     schema_version: u32,
+    #[serde(default)]
+    prepare: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +87,8 @@ struct ProxyHttpFile {
     working_directory: Option<String>,
     script: String,
     upstream: String,
+    #[serde(default)]
+    health_path: Option<String>,
     route: String,
 }
 
@@ -146,6 +150,13 @@ impl ChamberManager {
     }
 
     fn load_directory(root: &Path, only: Option<&str>) -> Result<Self, ChamberManagerError> {
+        Self::load_mode(root, only, true)
+    }
+    fn load_mode(
+        root: &Path,
+        only: Option<&str>,
+        enabled: bool,
+    ) -> Result<Self, ChamberManagerError> {
         fs::create_dir_all(root)
             .map_err(|error| manager_io_error(root, "could not create Chamber root", error))?;
         let entries = fs::read_dir(root)
@@ -172,7 +183,13 @@ impl ChamberManager {
                 continue;
             }
 
-            let directory = entry.path();
+            let base = entry.path();
+            let directory = if base.join("current").exists() {
+                fs::canonicalize(base.join("current"))
+                    .map_err(|e| manager_io_error(&base, "read current", e))?
+            } else {
+                base.clone()
+            };
             let config_path = directory.join("chamber.toml");
             let config_metadata = match fs::metadata(&config_path) {
                 Ok(metadata) => metadata,
@@ -351,9 +368,33 @@ impl ChamberManager {
                     ));
                 }
 
+                if proxy.health_path.as_ref().is_some_and(|p| {
+                    !p.starts_with('/') || p.starts_with("//") || p.contains(['\r', '\n', '#'])
+                }) {
+                    return Err(validation_error(
+                        &config_path,
+                        "health_path must be an absolute URL path",
+                    ));
+                }
                 proxy_http_mounts.push(ProxyHttpMount {
                     working_directory,
-                    script: proxy.script,
+                    script: format!(
+                        "export CHAMBER_DATA_DIR={} BLOG_DATABASE_PATH={}; {}",
+                        shell_quote(
+                            &fs::canonicalize(&base)
+                                .unwrap_or(base.clone())
+                                .join("data")
+                                .to_string_lossy()
+                        ),
+                        shell_quote(
+                            &fs::canonicalize(&base)
+                                .unwrap_or(base.clone())
+                                .join("data/blog.sqlite3")
+                                .to_string_lossy()
+                        ),
+                        proxy.script
+                    ),
+                    health_path: proxy.health_path,
                     upstream: proxy.upstream,
                     route,
                     config_path: config_path.clone(),
@@ -458,7 +499,9 @@ impl ChamberManager {
                         job.working_directory,
                         job.command,
                         job.timeout,
-                        job.enabled,
+                        job.enabled
+                            && enabled
+                            && !root.join(&chamber.name).join(".stopped").exists(),
                     )
                     .map_err(|error| {
                         validation_error(
@@ -550,42 +593,7 @@ impl ChamberManager {
         download: &crate::chamber::github::Download,
         app: &crate::app::App,
     ) -> Result<String, String> {
-        let staging_name = format!("import-{}", uuid::Uuid::new_v4());
-        let staged_download = crate::chamber::github::Download {
-            repository: download.repository.clone(),
-            branch: download.branch.clone(),
-            depth: download.depth,
-            directory: staging_name.clone(),
-        };
-        staged_download.run(&self.root)?;
-        let mut directory = self.root.join(&staging_name);
-        let result = (|| {
-            if !directory.join("chamber.toml").is_file() {
-                return Err("仓库根目录缺少 chamber.toml，无法导入 Chamber。".into());
-            }
-            let name = imported_chamber_name(&directory)?;
-            let destination = self.root.join(&name);
-            if destination
-                .try_exists()
-                .map_err(|error| error.to_string())?
-                || self.chambers.iter().any(|chamber| chamber.name == name)
-            {
-                return Err(format!("Chamber {name} 已存在，无法重复导入。"));
-            }
-            fs::rename(&directory, &destination)
-                .map_err(|error| format!("无法保存 Chamber：{error}"))?;
-            directory = destination;
-            let mut imported =
-                Self::load_directory(&self.root, Some(&name)).map_err(|error| error.to_string())?;
-            let chamber = imported.chambers.pop().ok_or("没有找到 Chamber 配置。")?;
-            self.add_chamber(chamber, app)
-                .map_err(|error| error.to_string())?;
-            Ok(name)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(directory);
-        }
-        result
+        self.install(download, None, app)
     }
 
     pub fn chambers(&self) -> &[Chamber] {
@@ -593,11 +601,17 @@ impl ChamberManager {
     }
 
     pub fn static_web_mounts(&self) -> impl Iterator<Item = &StaticWebMount> {
-        self.chambers.iter().flat_map(Chamber::static_web_mounts)
+        self.chambers
+            .iter()
+            .filter(|c| !self.root.join(&c.name).join(".stopped").exists())
+            .flat_map(Chamber::static_web_mounts)
     }
 
     pub fn proxy_http_mounts(&self) -> impl Iterator<Item = &ProxyHttpMount> {
-        self.chambers.iter().flat_map(Chamber::proxy_http_mounts)
+        self.chambers
+            .iter()
+            .filter(|c| !self.root.join(&c.name).join(".stopped").exists())
+            .flat_map(Chamber::proxy_http_mounts)
     }
 
     pub fn summaries(&self) -> Vec<ChamberSummary> {
@@ -645,6 +659,9 @@ impl ChamberManager {
     pub fn start_job(&self, id: u64) -> Result<Job, JobServiceError> {
         for chamber in &self.chambers {
             if chamber.jobs().iter().any(|job| job.id() == id) {
+                if self.stopped(&chamber.name) {
+                    return Err(JobServiceError::NotFound(id));
+                }
                 return chamber.start_job(id);
             }
         }
@@ -733,3 +750,9 @@ fn validation_error(path: impl AsRef<Path>, message: impl fmt::Display) -> Chamb
 #[cfg(test)]
 #[path = "tests/manager.rs"]
 mod tests;
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+#[path = "lifecycle.rs"]
+mod lifecycle;

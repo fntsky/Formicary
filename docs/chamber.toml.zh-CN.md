@@ -135,3 +135,43 @@ route = "/api-proxy"
 ## 9. 校验失败
 
 以下情况应报告包含 Chamber 路径及字段位置的错误，并终止启动：无法读取 TOML、版本不支持、Chamber 名称与目录名不一致、Job 名称重复或为空、字段缺失或类型错误、cron 无效、超时格式无效、工作目录不存在、静态目录不存在或不是目录、静态 route 无效或重复、proxyhttp route 重复或无效、upstream URL 不是有效的 HTTP URL，或出现未知字段。
+
+## 版本升级与生命周期
+
+管理员页面可关停、重新启动、升级或永久删除 Chamber，并删除非当前版本。
+删除整个 Chamber 会同时删除共享数据，需要在页面确认；删除旧 commit 不影响 `data/`。
+
+新导入使用以下布局：
+
+```text
+chamber/<name>/
+  releases/<完整commit>/chamber.toml
+  current -> releases/<完整commit>
+  data/
+```
+
+每次升级指定公开 GitHub 仓库和分支，记录完整 commit。下载和配置预检期间旧版本继续运行。
+可在 `[chamber]` 中设置 `prepare = "cargo build --release"`，在独立新版本目录运行准备命令（最长 300 秒）。
+预检会验证配置版本、目录、cron 和其他 Chamber 的同名挂载路由。
+切换时停止调度、终止并回收正在执行的任务和代理进程，然后原子替换 `current`。
+每个代理默认检查 upstream 的 `/healthz`，可用 `health_path = "/ready"` 覆盖；
+检查需在 20 秒内返回 2xx，代理提前退出也视为失败。所有代理通过后才恢复任务调度。
+失败自动切回旧代码；回滚版本也无法启动时保留关停状态并返回错误。
+纯静态或任务 Chamber 无 HTTP 健康检查。升级前已关停的 Chamber 升级后保持关停。
+
+代理启动环境自动提供 `CHAMBER_DATA_DIR` 和 `BLOG_DATABASE_PATH`，分别指向稳定的
+`<name>/data` 和 `<name>/data/blog.sqlite3`。应用应将上传文件等持久内容写入共享目录。
+数据库内容不会随代码回滚，迁移必须兼容旧版本。构建命令不应改动共享数据。
+
+旧版平铺目录仍可读取、关停和删除。首次升级前须先关停并备份，将代码移到
+`releases/<旧commit>/`，把数据库及上传等持久数据移到共享 `data/`，创建 `current`
+软链接，再重启 Formicary。系统不会自动猜测旧应用中哪些文件属于持久数据。
+
+管理 API（需登录）：
+
+- `POST /api/chambers/<name>/upgrade`：与导入相同的 repository、branch、depth JSON。
+- `POST /api/chambers/<name>/stop` 和 `/start`：持久化关停、重新启动。
+- `DELETE /api/chambers/<name>/releases/<commit>`：删除非当前版本。
+- `DELETE /api/chambers/<name>`：终止运行并永久删除所有代码和数据。
+
+升级操作同步返回，耗时包含下载、构建和健康检查；客户端应等待最终响应。

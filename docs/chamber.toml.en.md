@@ -135,3 +135,32 @@ Relative `working_directory` values resolve from the Chamber directory. For exam
 ## 9. Validation failures
 
 The loader should report the Chamber path and field context, then fail startup for unreadable TOML, an unsupported schema version, a Chamber name that differs from its directory name, duplicate or empty Job names, missing fields or wrong types, invalid cron syntax, invalid timeout format, a missing working directory, a missing path or non-directory staticweb directory, an invalid or duplicate staticweb route, a duplicate or invalid proxyhttp route, an invalid HTTP upstream URL, or unknown fields.
+
+## Releases and lifecycle
+
+The administrator can upgrade, stop, start, or permanently delete a Chamber and delete
+inactive releases. New imports use `<name>/releases/<full-commit>`, an atomically replaced
+`current` symlink, and shared `<name>/data`. Removing the whole Chamber also deletes data;
+removing an inactive release preserves it. Stopped state survives application restarts.
+
+An optional `[chamber] prepare = "cargo build --release"` command builds the isolated
+release before validation (300-second timeout). Upgrade validates configuration, directories,
+cron expressions and duplicate mount routes before stopping old jobs and proxies.
+Running jobs are terminated and workers reaped. Each proxy must return 2xx from its
+upstream `/healthz` within 20 seconds; override with `health_path = "/ready"` in its
+proxy configuration. Scheduling resumes after all checks pass. Failed activation restores
+the previous release; failed rollback leaves the Chamber stopped with an error.
+Previously stopped Chambers remain stopped after upgrade.
+
+Proxy scripts receive `CHAMBER_DATA_DIR` and `BLOG_DATABASE_PATH`, pointing to the shared
+data directory and its `blog.sqlite3`. Applications must place persistent uploads there.
+Code rollback does not roll back database changes; use backward-compatible migrations.
+
+Legacy flat layouts remain readable. Before upgrading one, stop and back it up, move code
+into `releases/<old-commit>`, move persistent files into shared `data`, create the `current`
+symlink, and restart Formicary. Persistent files are not guessed or moved automatically.
+
+Authenticated endpoints: `POST /api/chambers/<name>/upgrade` (repository, branch, depth),
+`POST /api/chambers/<name>/stop`, `POST /api/chambers/<name>/start`,
+`DELETE /api/chambers/<name>/releases/<commit>`, and `DELETE /api/chambers/<name>`.
+Upgrade responds synchronously after download, preparation and health checks.

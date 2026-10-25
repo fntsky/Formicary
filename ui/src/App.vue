@@ -200,6 +200,28 @@ async function downloadGithub() {
   }
 }
 
+const lifecycleBusy = ref(false)
+const upgradeRepository = ref('')
+const upgradeBranch = ref('main')
+async function chamberAction(action, method = 'POST') {
+  const name = selectedChamber.value
+  if (method === 'DELETE' && !window.confirm(action ? '确定删除这个旧版本？' : `确定删除 ${name}？所有版本、数据库和上传文件都将永久删除。`)) return
+  lifecycleBusy.value = true
+  chamberError.value = ''
+  try {
+    await requestJson(`/api/chambers/${encodeURIComponent(name)}${action ? '/' + action : ''}`, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      ...(action === 'upgrade' ? { body: JSON.stringify({ repository: upgradeRepository.value, branch: upgradeBranch.value, depth: 1 }) } : {}),
+    })
+    await loadChambers()
+    chamberNotice.value = '操作完成。'
+  } catch (error) {
+    await loadChambers()
+    chamberError.value = error.message
+  } finally { lifecycleBusy.value = false }
+}
+
 async function loadChamber(name) {
   const requestId = ++chamberRequestId
   selectedChamber.value = name
@@ -661,6 +683,7 @@ onMounted(async () => {
               class="chamber-list-item"
               :class="{ active: selectedChamber === item.name }"
               type="button"
+              :disabled="lifecycleBusy"
               @click="loadChamber(item.name)"
             >
               <span class="chamber-status-dot" aria-hidden="true"></span>
@@ -685,11 +708,26 @@ onMounted(async () => {
               <div class="detail-title-group">
                 <span class="detail-avatar" aria-hidden="true">{{ chamberDetails.name.slice(0, 1).toUpperCase() }}</span>
                 <div>
-                  <div class="detail-name-line"><h2>{{ chamberDetails.name }}</h2><span class="loaded-badge"><i></i>已加载</span></div>
+                  <div class="detail-name-line"><h2>{{ chamberDetails.name }}</h2><span class="loaded-badge"><i></i>{{ chamberDetails.stopped ? '已关停' : '运行中' }}</span></div>
                   <p class="path-label"><span aria-hidden="true">⌂</span>{{ chamberDetails.directory }}</p>
                 </div>
               </div>
             </div>
+
+            <section class="empty-card" aria-label="版本和生命周期管理">
+              <p>当前版本：{{ chamberDetails.current_commit }}</p>
+              <button class="refresh-button" :disabled="lifecycleBusy" @click="chamberAction(chamberDetails.stopped ? 'start' : 'stop')">{{ chamberDetails.stopped ? '启动 Chamber' : '关停 Chamber' }}</button>
+              <button class="refresh-button" :disabled="lifecycleBusy" @click="chamberAction('', 'DELETE')">删除整个 Chamber</button>
+              <form @submit.prevent="chamberAction('upgrade')">
+                <label>升级仓库 <input v-model="upgradeRepository" placeholder="owner/repo" required :disabled="lifecycleBusy" /></label>
+                <label>分支 <input v-model="upgradeBranch" required :disabled="lifecycleBusy" /></label>
+                <button class="primary-button" :disabled="lifecycleBusy">{{ lifecycleBusy ? '正在处理，请稍候…' : '准备、校验并升级' }}</button>
+              </form>
+              <p>升级失败自动回滚代码。共享数据库迁移需要兼容旧版本。</p>
+              <ul><li v-for="commit in chamberDetails.releases" :key="commit">{{ commit }}
+                <button v-if="commit !== chamberDetails.current_commit" :disabled="lifecycleBusy" @click="chamberAction('releases/' + encodeURIComponent(commit), 'DELETE')">删除旧版本</button>
+              </li></ul>
+            </section>
 
             <nav class="detail-tabs" aria-label="Chamber 详情">
               <button :class="{ selected: chamberTab === 'jobs' }" @click="chamberTab = 'jobs'">定时任务 <span>{{ chamberDetails.job_count }}</span></button>
