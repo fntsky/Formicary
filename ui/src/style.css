@@ -571,3 +571,40 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   .chamber-list { display: flex; overflow-x: auto; gap: 6px; }
   .chamber-list-item { width: auto; min-width: 160px; flex: 0 0 auto; }
 }
+
+.chamber-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex-shrink: 0; }
+.chamber-delete-button, .release-delete { border: 1px solid #ecd9d5; border-radius: 8px; background: #fff; color: #a54032; padding: 0 14px; min-height: 40px; font-size: 12px; font-weight: 600; cursor: pointer; }
+.chamber-delete-button:hover:not(:disabled), .release-delete:hover:not(:disabled) { background: #fff4f1; border-color: #dca99f; }
+.chamber-delete-button:disabled, .release-delete:disabled { opacity: .55; cursor: wait; }
+.loaded-badge.stopped { background: #f2f3f1; color: #70776f; border-color: #e1e5df; }
+.loaded-badge.stopped i { background: #949c92; }
+.version-panel { max-width: 960px; }
+.version-kind { font-size: 11px; color: #788578; }
+.current-release { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; padding: 16px 18px; border: 1px solid #e5ebe3; border-radius: 10px; background: #f8faf7; font-size: 12px; color: #728070; }
+.current-release code { font-size: 12px; color: #344c3d; overflow-wrap: anywhere; }
+.version-hint { margin: 18px 0 4px; max-width: 650px; color: #778274; font-size: 12px; line-height: 1.9; }
+.upgrade-form { margin-top: 24px; padding: 22px; border: 1px solid #e5ebe3; border-radius: 10px; }
+.upgrade-heading h4, .release-history h4 { margin: 0; font-size: 13px; color: #344c3d; }
+.upgrade-heading p { margin: 8px 0 20px; color: #7e897b; font-size: 12px; line-height: 1.7; }
+.upgrade-fields { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+.upgrade-fields label { display: grid; gap: 8px; color: #53664f; font-size: 12px; }
+.upgrade-fields input { box-sizing: border-box; width: 100%; min-width: 0; height: 42px; padding: 0 12px; border: 1px solid #dce5d8; border-radius: 7px; background: #fff; color: #2e4433; font: inherit; }
+.upgrade-fields input:focus-visible { outline: 2px solid #4a875b; outline-offset: 2px; }
+.upgrade-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 20px; }
+.upgrade-footer > span { color: #889181; font-size: 11px; line-height: 1.7; }
+.upgrade-footer .primary-button { width: auto; min-height: 40px; margin: 0; padding: 0 20px; font-size: 12px; flex-shrink: 0; }
+.release-history { margin-top: 26px; }
+.release-history h4 { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+.release-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 54px; border-bottom: 1px solid #edf0ec; }
+.release-row code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #586952; font-size: 12px; }
+.release-row > span, .release-row > button { flex-shrink: 0; }
+.release-delete { min-height: 30px; padding: 0 10px; font-size: 11px; }
+@media (max-width: 700px) {
+  .detail-heading { flex-wrap: wrap; }
+  .chamber-controls { width: 100%; padding-top: 4px; }
+  .chamber-controls > button { flex: 1; }
+  .upgrade-form { padding: 16px; }
+  .upgrade-fields { grid-template-columns: 1fr; }
+  .upgrade-footer { align-items: stretch; flex-direction: column; }
+}
+.chamber-status-dot.stopped { background: #949c92; box-shadow: 0 0 0 3px #edf0eb; }

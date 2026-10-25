@@ -686,7 +686,7 @@ onMounted(async () => {
               :disabled="lifecycleBusy"
               @click="loadChamber(item.name)"
             >
-              <span class="chamber-status-dot" aria-hidden="true"></span>
+              <span class="chamber-status-dot" :class="{ stopped: item.stopped }" aria-hidden="true"></span>
               <span class="chamber-list-copy">
                 <strong>{{ item.name }}</strong>
                 <span>{{ item.job_count }} 个任务 · {{ item.static_web_count + item.proxy_http_count }} 个挂载</span>
@@ -708,33 +708,43 @@ onMounted(async () => {
               <div class="detail-title-group">
                 <span class="detail-avatar" aria-hidden="true">{{ chamberDetails.name.slice(0, 1).toUpperCase() }}</span>
                 <div>
-                  <div class="detail-name-line"><h2>{{ chamberDetails.name }}</h2><span class="loaded-badge"><i></i>{{ chamberDetails.stopped ? '已关停' : '运行中' }}</span></div>
+                  <div class="detail-name-line"><h2>{{ chamberDetails.name }}</h2><span class="loaded-badge" :class="{ stopped: chamberDetails.stopped }"><i></i>{{ chamberDetails.stopped ? '已关停' : '运行中' }}</span></div>
                   <p class="path-label"><span aria-hidden="true">⌂</span>{{ chamberDetails.directory }}</p>
                 </div>
               </div>
+              <div class="chamber-controls">
+                <button type="button" class="refresh-button" :disabled="lifecycleBusy" @click="chamberAction(chamberDetails.stopped ? 'start' : 'stop')">{{ lifecycleBusy ? '处理中…' : chamberDetails.stopped ? '启动服务' : '关停服务' }}</button>
+                <button type="button" class="chamber-delete-button" :disabled="lifecycleBusy" @click="chamberAction('', 'DELETE')">删除 Chamber</button>
+              </div>
             </div>
-
-            <section class="empty-card" aria-label="版本和生命周期管理">
-              <p>当前版本：{{ chamberDetails.current_commit }}</p>
-              <button class="refresh-button" :disabled="lifecycleBusy" @click="chamberAction(chamberDetails.stopped ? 'start' : 'stop')">{{ chamberDetails.stopped ? '启动 Chamber' : '关停 Chamber' }}</button>
-              <button class="refresh-button" :disabled="lifecycleBusy" @click="chamberAction('', 'DELETE')">删除整个 Chamber</button>
-              <form @submit.prevent="chamberAction('upgrade')">
-                <label>升级仓库 <input v-model="upgradeRepository" placeholder="owner/repo" required :disabled="lifecycleBusy" /></label>
-                <label>分支 <input v-model="upgradeBranch" required :disabled="lifecycleBusy" /></label>
-                <button class="primary-button" :disabled="lifecycleBusy">{{ lifecycleBusy ? '正在处理，请稍候…' : '准备、校验并升级' }}</button>
-              </form>
-              <p>升级失败自动回滚代码。共享数据库迁移需要兼容旧版本。</p>
-              <ul><li v-for="commit in chamberDetails.releases" :key="commit">{{ commit }}
-                <button v-if="commit !== chamberDetails.current_commit" :disabled="lifecycleBusy" @click="chamberAction('releases/' + encodeURIComponent(commit), 'DELETE')">删除旧版本</button>
-              </li></ul>
-            </section>
 
             <nav class="detail-tabs" aria-label="Chamber 详情">
               <button :class="{ selected: chamberTab === 'jobs' }" @click="chamberTab = 'jobs'">定时任务 <span>{{ chamberDetails.job_count }}</span></button>
               <button :class="{ selected: chamberTab === 'mounts' }" @click="chamberTab = 'mounts'">服务挂载 <span>{{ chamberDetails.static_web.length + chamberDetails.proxy_http.length }}</span></button>
+              <button :class="{ selected: chamberTab === 'versions' }" @click="chamberTab = 'versions'">版本与升级</button>
             </nav>
 
-            <div v-if="chamberTab === 'jobs'" class="detail-body">
+            <div v-if="chamberTab === 'versions'" class="detail-body version-panel">
+              <div class="tab-content-heading"><h3>版本与升级</h3><span class="version-kind">{{ chamberDetails.current_commit ? '版本管理已启用' : '旧目录布局' }}</span></div>
+              <div class="current-release"><span>当前版本</span><code>{{ chamberDetails.current_commit || '尚未纳入版本管理' }}</code></div>
+              <p v-if="!chamberDetails.current_commit" class="version-hint">此 Chamber 使用旧目录布局。升级前需先关停并迁移到 releases / current / data 布局；关停和删除可直接使用。</p>
+              <form v-else class="upgrade-form" @submit.prevent="chamberAction('upgrade')">
+                <div class="upgrade-heading"><h4>从 GitHub 升级</h4><p>准备新版本并校验，健康检查失败时自动恢复旧版本。</p></div>
+                <div class="upgrade-fields">
+                  <label>仓库<input v-model="upgradeRepository" placeholder="owner/repo" required :disabled="lifecycleBusy" /></label>
+                  <label>分支<input v-model="upgradeBranch" placeholder="main" required :disabled="lifecycleBusy" /></label>
+                </div>
+                <div class="upgrade-footer"><span>共享数据保留，数据库迁移需兼容旧版本。</span><button class="primary-button" :disabled="lifecycleBusy">{{ lifecycleBusy ? '正在升级…' : '校验并升级' }}</button></div>
+              </form>
+              <section v-if="chamberDetails.releases.length" class="release-history">
+                <h4>已保存的版本 <span class="count-pill">{{ chamberDetails.releases.length }}</span></h4>
+                <div v-for="commit in chamberDetails.releases" :key="commit" class="release-row"><code :title="commit">{{ commit }}</code>
+                  <span v-if="commit === chamberDetails.current_commit" class="loaded-badge">当前使用</span>
+                  <button v-else type="button" class="release-delete" :disabled="lifecycleBusy" @click="chamberAction('releases/' + encodeURIComponent(commit), 'DELETE')">删除旧版本</button>
+                </div>
+              </section>
+            </div>
+            <div v-else-if="chamberTab === 'jobs'" class="detail-body">
               <div class="tab-content-heading"><div><h3>定时任务</h3></div><span class="count-pill">{{ chamberDetails.jobs.length }} 项</span></div>
               <div v-if="!chamberDetails.jobs.length" class="empty-card">这个 Chamber 还没有定时任务。</div>
               <div v-else class="table-wrap">
@@ -747,7 +757,7 @@ onMounted(async () => {
                       <td class="directory-cell" :title="job.working_directory">{{ job.working_directory }}</td>
                       <td class="muted-cell">{{ formatTimeout(job.timeout_ms) }}</td>
                       <td><span class="job-status" :class="{ paused: !job.enabled }"><i></i>{{ job.enabled ? '已启用' : '已暂停' }}</span></td>
-                      <td><button class="job-action" :class="{ resume: !job.enabled }" :disabled="busyJob === job.id" @click="toggleJob(job)">{{ busyJob === job.id ? '处理中…' : job.enabled ? '暂停' : '启动' }}</button></td>
+                      <td><button class="job-action" :class="{ resume: !job.enabled }" :disabled="busyJob === job.id || chamberDetails.stopped || lifecycleBusy" @click="toggleJob(job)">{{ busyJob === job.id ? '处理中…' : job.enabled ? '暂停' : '启动' }}</button></td>
                     </tr>
                   </tbody>
                 </table>

@@ -227,7 +227,7 @@ fn chamber_route(
                     let mut value = chamber_json(chamber);
                     value["stopped"] = json!(chambers.stopped(&name));
                     value["releases"] = json!(chambers.releases(&name));
-                    value["current_commit"] = json!(chamber.directory.file_name().and_then(|s| s.to_str()));
+                    value["current_commit"] = json!(chamber.directory.parent().filter(|p| p.file_name().is_some_and(|n| n == "releases")).and_then(|_| chamber.directory.file_name()).and_then(|s| s.to_str()));
                     value
                 })}),
             ))
