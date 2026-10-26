@@ -13,6 +13,8 @@ pub struct Request {
 
 /// Response data returned by the application handlers and translated into an Axum response.
 pub struct Response {
+    /// Deferred upgrade, executed by the async HTTP layer after routing and authentication.
+    pub(crate) websocket: Option<Box<crate::proxy_http::WebSocketPlan>>,
     pub status: String,
     pub content_type: String,
     pub body: Vec<u8>,
@@ -23,6 +25,7 @@ pub struct Response {
 impl Response {
     pub fn new(status: impl Into<String>, content_type: impl Into<String>, body: Vec<u8>) -> Self {
         Self {
+            websocket: None,
             status: status.into(),
             content_type: content_type.into(),
             body,

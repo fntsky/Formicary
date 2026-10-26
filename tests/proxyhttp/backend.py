@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
+import hashlib
+import struct
 import json
 from pathlib import Path
 import signal
@@ -20,7 +23,45 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
-        self.respond()
+        if self.headers.get("Upgrade", "").lower() == "websocket" and self.path.startswith(("/v1/ws", "/ws")):
+            self.websocket()
+        else:
+            self.respond()
+
+    def websocket(self) -> None:
+        key = self.headers["Sec-WebSocket-Key"]
+        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        self.send_response(101)
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.send_header("Sec-WebSocket-Protocol", "echo")
+        self.end_headers()
+        def send(opcode, payload):
+            length = len(payload)
+            header = bytes([opcode, length]) if length < 126 else bytes([opcode, 126]) + struct.pack("!H", length) if length < 65536 else bytes([opcode, 127]) + struct.pack("!Q", length)
+            self.wfile.write(header + payload)
+            self.wfile.flush()
+        # Send immediately after 101 to exercise bytes buffered during the upgrade.
+        send(0x81, json.dumps({"path": self.path, "headers": dict(self.headers)}).encode())
+        while True:
+            header = self.rfile.read(2)
+            if not header:
+                break
+            opcode, length = header
+            assert length & 128
+            length &= 127
+            if length == 126:
+                length = struct.unpack("!H", self.rfile.read(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self.rfile.read(8))[0]
+            mask = self.rfile.read(4)
+            payload = self.rfile.read(length)
+            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+            send(0x8A if opcode == 0x89 else opcode, payload)
+            if opcode == 0x88:
+                break
+        self.close_connection = True
 
     def do_HEAD(self) -> None:
         self.respond(head_only=True)

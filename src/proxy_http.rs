@@ -74,6 +74,7 @@ pub(crate) struct ProxyMount {
     upstream: Upstream,
     client: Arc<OnceLock<Result<Client, String>>>,
     execution: Arc<ShellExecution>,
+    cancel: tokio::sync::watch::Sender<bool>,
 }
 
 impl ProxyMount {
@@ -95,7 +96,12 @@ impl ProxyMount {
             upstream,
             client: Arc::new(OnceLock::new()),
             execution: Arc::new(execution),
+            cancel: tokio::sync::watch::channel(false).0,
         })
+    }
+
+    pub(crate) fn cancel_connections(&self) {
+        self.cancel.send_replace(true);
     }
 
     /// Returns this proxy's shared shell handle for logs, input, and termination.
@@ -118,6 +124,21 @@ impl ProxyMount {
     }
 
     pub(crate) fn forward(&self, request: &Request, identity: Option<&ProxyIdentity>) -> Response {
+        if is_websocket_request(request) {
+            let mut response = Response::new("101 Switching Protocols", "", Vec::new());
+            response.websocket = Some(Box::new(WebSocketPlan {
+                mount: self.clone(),
+                request: Request {
+                    method: request.method.clone(),
+                    target: request.target.clone(),
+                    path: request.path.clone(),
+                    headers: request.headers.clone(),
+                    body: request.body.clone(),
+                },
+                identity: identity.cloned(),
+            }));
+            return response;
+        }
         match self.try_forward(request, identity) {
             Ok(response) => response,
             Err(error) => {
@@ -165,46 +186,7 @@ impl ProxyMount {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let mut builder = client.request(method, url).header(CONNECTION, "close");
 
-        if let Some(identity) = identity
-            && !identity.username.contains(['\r', '\n'])
-        {
-            let principal = identity.principal();
-            builder = builder
-                .header("X-Formicary-User", identity.username.as_str())
-                .header("X-Formicary-Auth", identity.auth_name())
-                .header("X-Formicary-Principal", principal.as_str());
-            if let Some(key_id) = &identity.key_id {
-                builder = builder.header("X-Formicary-Key-Id", key_id.as_str());
-            }
-        }
-        let strip_session_cookie =
-            identity.is_some_and(|identity| identity.auth == ProxyAuth::ApiKey);
-        let connection_headers = connection_header_tokens(&request.headers);
-        for (name, value) in &request.headers {
-            if name.starts_with("x-formicary-")
-                || name == "x-api-key"
-                || (name == "authorization" && is_formicary_bearer(value))
-                || is_hop_by_hop(name)
-                || connection_headers.contains(name)
-            {
-                continue;
-            }
-            let forwarded_value = if name == "cookie" && strip_session_cookie {
-                let Some(cookie) = strip_formicary_session_cookie(value) else {
-                    continue;
-                };
-                cookie
-            } else {
-                value.clone()
-            };
-            let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(&forwarded_value),
-            ) else {
-                continue;
-            };
-            builder = builder.header(name, value);
-        }
+        builder = builder.headers(forward_headers(request, identity));
 
         let response = builder
             .body(request.body.clone())
@@ -620,5 +602,225 @@ mod identity_tests {
         assert!(captured.starts_with("GET /hello?x=1 HTTP/1.1"));
 
         mount.shell().terminate();
+    }
+}
+
+fn forward_headers(request: &Request, identity: Option<&ProxyIdentity>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let connection_headers = connection_header_tokens(&request.headers);
+    for (name, value) in &request.headers {
+        if name.starts_with("x-formicary-")
+            || name == "x-api-key"
+            || (name == "authorization" && is_formicary_bearer(value))
+            || is_hop_by_hop(name)
+            || connection_headers.contains(name)
+        {
+            continue;
+        }
+        let value = if name == "cookie" && identity.is_some_and(|id| id.auth == ProxyAuth::ApiKey) {
+            let Some(value) = strip_formicary_session_cookie(value) else {
+                continue;
+            };
+            value
+        } else {
+            value.clone()
+        };
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    if let Some(identity) = identity {
+        for (name, value) in [
+            ("x-formicary-user", identity.username.clone()),
+            ("x-formicary-auth", identity.auth_name().to_owned()),
+            ("x-formicary-principal", identity.principal()),
+        ]
+        .into_iter()
+        .chain(
+            identity
+                .key_id
+                .as_ref()
+                .map(|id| ("x-formicary-key-id", id.clone())),
+        ) {
+            if let Ok(value) = HeaderValue::from_str(&value) {
+                headers.insert(name, value);
+            }
+        }
+    }
+    headers
+}
+
+fn is_websocket_request(request: &Request) -> bool {
+    request
+        .headers
+        .get("upgrade")
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        && connection_header_tokens(&request.headers)
+            .iter()
+            .any(|token| token == "upgrade")
+}
+
+/// A routed and authenticated handshake; never performs blocking IO on the async runtime.
+pub(crate) struct WebSocketPlan {
+    mount: ProxyMount,
+    request: Request,
+    identity: Option<ProxyIdentity>,
+}
+
+impl WebSocketPlan {
+    pub(crate) async fn forward(
+        self,
+        downstream: Option<hyper::upgrade::OnUpgrade>,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::{Request as HttpRequest, StatusCode};
+        use hyper_util::rt::TokioIo;
+        let failure = |status, message: &'static str| {
+            let mut response = axum::response::Response::new(Body::from(message));
+            *response.status_mut() = status;
+            response
+        };
+        let Some(downstream) = downstream else {
+            return failure(StatusCode::BAD_REQUEST, "WebSocket upgrade unavailable\n");
+        };
+        if self.request.method != "GET" || !self.request.body.is_empty() {
+            return failure(StatusCode::BAD_REQUEST, "Invalid WebSocket handshake\n");
+        }
+        let mut cancel = self.mount.cancel.subscribe();
+        if *cancel.borrow() || self.mount.shell().is_finished() {
+            return failure(StatusCode::BAD_GATEWAY, "Upstream service unavailable\n");
+        }
+        let target = match self.mount.upstream_target(&self.request.target) {
+            Ok(target) => target,
+            Err(_) => return failure(StatusCode::BAD_REQUEST, "Invalid request target\n"),
+        };
+        let handshake = async {
+            let url = reqwest::Url::parse(&format!("http://{}", self.mount.upstream.authority))
+                .map_err(io::Error::other)?;
+            let host = url
+                .host_str()
+                .expect("validated upstream host")
+                .trim_matches(['[', ']']);
+            let stream = tokio::net::TcpStream::connect((
+                host,
+                url.port_or_known_default()
+                    .expect("validated upstream port"),
+            ));
+            let stream = tokio::time::timeout(CONNECT_TIMEOUT, stream)
+                .await
+                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .map_err(io::Error::other)?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.with_upgrades().await {
+                    eprintln!("WebSocket upstream connection failed: {error}");
+                }
+            });
+            let mut request = HttpRequest::builder()
+                .method("GET")
+                .uri(target)
+                .body(Body::empty())
+                .map_err(io::Error::other)?;
+            *request.headers_mut() = forward_headers(&self.request, self.identity.as_ref());
+            request.headers_mut().insert(
+                "host",
+                HeaderValue::from_str(&self.mount.upstream.authority).map_err(io::Error::other)?,
+            );
+            request
+                .headers_mut()
+                .insert("connection", HeaderValue::from_static("upgrade"));
+            request
+                .headers_mut()
+                .insert("upgrade", HeaderValue::from_static("websocket"));
+            sender.send_request(request).await.map_err(io::Error::other)
+        };
+        let upstream = tokio::select! {
+            result = tokio::time::timeout(CONNECT_TIMEOUT + IO_TIMEOUT, handshake) => match result {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    eprintln!("WebSocket handshake failed: {error}");
+                    let status = if error.kind() == io::ErrorKind::TimedOut { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::BAD_GATEWAY };
+                    return failure(status, "Upstream handshake failed\n");
+                }
+                Err(_) => return failure(StatusCode::GATEWAY_TIMEOUT, "Upstream handshake timed out\n"),
+            },
+            _ = cancel.changed() => return failure(StatusCode::BAD_GATEWAY, "Proxy unmounted\n"),
+            _ = crate::app::shutdown_signal() => return failure(StatusCode::SERVICE_UNAVAILABLE, "Server shutting down\n"),
+        };
+        let mut upstream = upstream;
+        if upstream.status() != StatusCode::SWITCHING_PROTOCOLS {
+            // Stream a rejected handshake as an ordinary HTTP response.
+            let connection_headers = response_connection_header_tokens(upstream.headers());
+            strip_upgrade_response_headers(upstream.headers_mut(), &connection_headers);
+            return upstream.map(Body::new);
+        }
+        if !upstream
+            .headers()
+            .get("upgrade")
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+            || !response_connection_header_tokens(upstream.headers())
+                .iter()
+                .any(|token| token == "upgrade")
+            || !upstream.headers().contains_key("sec-websocket-accept")
+        {
+            return failure(
+                StatusCode::BAD_GATEWAY,
+                "Invalid upstream WebSocket handshake\n",
+            );
+        }
+        let upgraded = hyper::upgrade::on(&mut upstream);
+        let (mut parts, _) = upstream.into_parts();
+        let connection_headers = response_connection_header_tokens(&parts.headers);
+        strip_upgrade_response_headers(&mut parts.headers, &connection_headers);
+        parts
+            .headers
+            .insert("connection", HeaderValue::from_static("upgrade"));
+        parts
+            .headers
+            .insert("upgrade", HeaderValue::from_static("websocket"));
+        tokio::spawn(async move {
+            let tunnel = async {
+                let (downstream, upstream) = tokio::try_join!(downstream, upgraded)?;
+                tokio::io::copy_bidirectional(
+                    &mut TokioIo::new(downstream),
+                    &mut TokioIo::new(upstream),
+                )
+                .await?;
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+            };
+            let process_exit = async {
+                while !self.mount.shell().is_finished() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            tokio::select! {
+                result = tunnel => if let Err(error) = result { eprintln!("WebSocket tunnel closed: {error}"); },
+                _ = cancel.changed() => {},
+                _ = crate::app::shutdown_signal() => {},
+                _ = process_exit => {},
+            }
+        });
+        axum::response::Response::from_parts(parts, Body::empty())
+    }
+}
+
+fn strip_upgrade_response_headers(headers: &mut HeaderMap, connection_headers: &[String]) {
+    let remove: Vec<_> = headers
+        .keys()
+        .filter(|name| {
+            is_hop_by_hop(name.as_str())
+                || connection_headers
+                    .iter()
+                    .any(|token| token == name.as_str())
+        })
+        .cloned()
+        .collect();
+    for name in remove {
+        headers.remove(name);
     }
 }

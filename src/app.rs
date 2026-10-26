@@ -197,7 +197,14 @@ impl App {
             .write()
             .map_err(|_| io::Error::other("mount registry is unavailable"))?;
         let original_len = mounts.proxy_http.len();
-        mounts.proxy_http.retain(|mount| mount.route != route);
+        mounts.proxy_http.retain(|mount| {
+            if mount.route == route {
+                mount.cancel_connections();
+                false
+            } else {
+                true
+            }
+        });
         Ok(mounts.proxy_http.len() != original_len)
     }
 
@@ -351,7 +358,7 @@ fn http_router(state: HttpState) -> Router {
         .with_state(state)
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     while !CTRL_C_REQUESTED.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -362,6 +369,7 @@ async fn dispatch_request(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    upgrade: Option<axum::extract::Extension<hyper::upgrade::OnUpgrade>>,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> axum::response::Response {
     let body = match body {
@@ -383,7 +391,7 @@ async fn dispatch_request(
         .map(|value| value.as_str())
         .unwrap_or(uri.path())
         .to_owned();
-    let headers = headers
+    let mut request_headers: std::collections::HashMap<String, String> = headers
         .iter()
         .filter_map(|(name, value)| {
             value
@@ -392,11 +400,26 @@ async fn dispatch_request(
                 .map(|value| (name.as_str().to_owned(), value.to_owned()))
         })
         .collect();
+    // These fields allow comma-separated values across multiple header lines.
+    for name in [
+        "connection",
+        "sec-websocket-protocol",
+        "sec-websocket-extensions",
+    ] {
+        let values: Vec<_> = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        if !values.is_empty() {
+            request_headers.insert(name.to_owned(), values.join(", "));
+        }
+    }
     let request = Request {
         method: method.as_str().to_owned(),
         target,
         path,
-        headers,
+        headers: request_headers,
         body: body.to_vec(),
     };
     let app = state.app;
@@ -459,6 +482,10 @@ async fn dispatch_request(
         )
     });
 
+    let mut response = response;
+    if let Some(plan) = response.websocket.take() {
+        return plan.forward(upgrade.map(|upgrade| upgrade.0)).await;
+    }
     to_framework_response(response, method == Method::HEAD)
 }
 

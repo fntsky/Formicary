@@ -15,6 +15,9 @@ import sys
 import tempfile
 import time
 
+sys.dont_write_bytecode = True
+from websocket_checks import run_checks, run_shutdown_check
+
 
 def reserve_local_ports(count: int) -> list[int]:
     listeners: list[socket.socket] = []
@@ -303,6 +306,10 @@ schema_version = 1
                 if status != 404:
                     raise RuntimeError(f"unmatched /proxy-extra route returned {status}; expected 404")
 
+                print("Checking WebSocket handshake, frames, identity filtering, and long-lived connections...")
+                run_checks(port, temporary / "auth.sqlite3")
+                run_shutdown_check(port, process)
+
                 print(
                     "PASS: Chamber [proxyhttp] and [[proxyhttp]] entries started local services, "
                     "stripped route prefixes, preserved queries and bodies, decoded chunked responses, "
@@ -311,6 +318,8 @@ schema_version = 1
                 return 0
             except Exception as error:
                 server_log.flush()
+                import traceback
+                traceback.print_exc()
                 print(f"FAIL: {error}", file=sys.stderr)
                 print_log_tail(log_path)
                 return 1
