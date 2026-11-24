@@ -591,9 +591,10 @@ impl ChamberManager {
     pub fn import_github(
         &mut self,
         download: &crate::chamber::github::Download,
+        token: Option<&str>,
         app: &crate::app::App,
     ) -> Result<String, String> {
-        self.install(download, None, app)
+        self.install(download, token, None, app)
     }
 
     pub fn chambers(&self) -> &[Chamber] {

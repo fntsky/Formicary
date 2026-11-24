@@ -98,9 +98,9 @@ pub fn handle(
         )),
         ("POST", "/api/login") => login(request, database),
         ("GET", "/api/me") => current_user(request, database),
-        ("POST", "/api/logout") => logout(request, database),
+        ("POST", "/api/logout") => logout(request, database, app),
         ("POST", "/api/admin/username") => change_username(request, database),
-        ("POST", "/api/admin/password") => change_password(request, database),
+        ("POST", "/api/admin/password") => change_password(request, database, app),
         _ if keys::matches_path(&request.path) => keys::handle(request, database),
         _ if chambers::matches_path(&request.path) => {
             chambers::handle(request, database, chambers, app)
@@ -257,7 +257,11 @@ fn change_username(request: &Request, database: &Connection) -> rusqlite::Result
     ))
 }
 
-fn change_password(request: &Request, database: &mut Connection) -> rusqlite::Result<Response> {
+fn change_password(
+    request: &Request,
+    database: &mut Connection,
+    app: &crate::app::App,
+) -> rusqlite::Result<Response> {
     let Some(user_id) = authenticated_user_id(request, database)? else {
         return Ok(unauthorized_response());
     };
@@ -287,6 +291,7 @@ fn change_password(request: &Request, database: &mut Connection) -> rusqlite::Re
     )?;
     transaction.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
     transaction.commit()?;
+    app.github_auth().clear();
 
     let mut response = Response::json("200 OK", json!({"ok": true, "login_required": true}));
     response.headers.push(expired_session_cookie());
@@ -346,9 +351,14 @@ pub(super) fn verify_current_password(
         .unwrap_or(false))
 }
 
-fn logout(request: &Request, database: &Connection) -> rusqlite::Result<Response> {
+fn logout(
+    request: &Request,
+    database: &Connection,
+    app: &crate::app::App,
+) -> rusqlite::Result<Response> {
     if let Some(token) = session_token(request) {
         database.execute("DELETE FROM sessions WHERE token = ?1", params![token])?;
+        app.github_auth().disconnect(token);
     }
 
     let mut response = Response::json("200 OK", json!({"ok": true}));

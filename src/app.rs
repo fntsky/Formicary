@@ -5,7 +5,7 @@ use std::io;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ use crate::{
     api,
     auth::{KeyAuthentication, authenticate_key},
     chamber::ChamberManager,
+    github_auth::GithubAuth,
     migrations,
     proxy_http::{ProxyIdentity, ProxyMount},
     ui,
@@ -49,6 +50,7 @@ struct StaticDirectory {
 #[derive(Debug, Clone, Default)]
 pub struct App {
     mounts: Arc<RwLock<MountRegistry>>,
+    github_auth: Arc<Mutex<GithubAuth>>,
 }
 
 #[derive(Debug, Default)]
@@ -72,6 +74,12 @@ struct RuntimeState {
 impl App {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn github_auth(&self) -> MutexGuard<'_, GithubAuth> {
+        self.github_auth
+            .lock()
+            .expect("GitHub authorization lock poisoned")
     }
 
     /// Returns the shared App instance used by the default `app::run()` entry point.

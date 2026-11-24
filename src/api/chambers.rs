@@ -6,7 +6,7 @@ use crate::http_types::{Request, Response};
 use crate::service::job::Job;
 use crate::service::job_service::JobServiceError;
 
-use super::{authenticated_user_id, unauthorized_response};
+use super::{authenticated_user_id, no_store, session_token, unauthorized_response};
 
 pub(super) fn matches_path(path: &str) -> bool {
     path == "/api/chambers"
@@ -22,6 +22,7 @@ pub(super) fn handle(
     app: &crate::app::App,
 ) -> rusqlite::Result<Response> {
     match (request.method.as_str(), request.path.as_str()) {
+        (_, "/api/chambers/github/account") => github_account(request, database, app),
         ("POST", "/api/chambers/github/branches") => {
             if authenticated_user_id(request, database)?.is_none() {
                 return Ok(unauthorized_response());
@@ -34,8 +35,9 @@ pub(super) fn handle(
                 Ok(value) => value,
                 Err(response) => return Ok(response),
             };
+            let token = session_token(request).and_then(|session| app.github_auth().token(session));
             Ok(
-                match crate::chamber::github::list_branches(&input.repository) {
+                match crate::chamber::github::list_branches(&input.repository, token.as_deref()) {
                     Ok(branches) => Response::json("200 OK", json!(branches)),
                     Err(error) => Response::json("400 Bad Request", json!({"error": error})),
                 },
@@ -49,10 +51,13 @@ pub(super) fn handle(
                 Ok(value) => value,
                 Err(response) => return Ok(response),
             };
-            Ok(match chambers.import_github(&download, app) {
-                Ok(name) => Response::json("201 Created", json!({"name": name})),
-                Err(error) => Response::json("400 Bad Request", json!({"error": error})),
-            })
+            let token = session_token(request).and_then(|session| app.github_auth().token(session));
+            Ok(
+                match chambers.import_github(&download, token.as_deref(), app) {
+                    Ok(name) => Response::json("201 Created", json!({"name": name})),
+                    Err(error) => Response::json("400 Bad Request", json!({"error": error})),
+                },
+            )
         }
         ("GET", "/api/chambers") => list_chambers(request, database, chambers),
         ("GET", "/api/jobs") => list_jobs(request, database, chambers),
@@ -64,6 +69,35 @@ pub(super) fn handle(
         }
         _ => Ok(method_not_allowed_response()),
     }
+}
+
+fn github_account(
+    request: &Request,
+    database: &Connection,
+    app: &crate::app::App,
+) -> rusqlite::Result<Response> {
+    let Some(session) = session_token(request) else {
+        return Ok(no_store(unauthorized_response()));
+    };
+    if authenticated_user_id(request, database)?.is_none() {
+        return Ok(no_store(unauthorized_response()));
+    }
+
+    let mut github = app.github_auth();
+    let result = match request.method.as_str() {
+        "GET" => Ok(github.status(session)),
+        "POST" => github.start(session),
+        "PATCH" => github.poll(session),
+        "DELETE" => {
+            github.disconnect(session);
+            Ok(github.status(session))
+        }
+        _ => return Ok(method_not_allowed_response()),
+    };
+    Ok(no_store(match result {
+        Ok(status) => Response::json("200 OK", json!(status)),
+        Err(error) => Response::json("400 Bad Request", json!({"error": error})),
+    }))
 }
 
 fn list_chambers(
@@ -141,7 +175,11 @@ fn chamber_route(
                             Ok(v) => v,
                             Err(r) => return Ok(r),
                         };
-                    chambers.install(&input, Some(&name), app).map(|_| ())
+                    let token =
+                        session_token(request).and_then(|session| app.github_auth().token(session));
+                    chambers
+                        .install(&input, token.as_deref(), Some(&name), app)
+                        .map(|_| ())
                 }
                 _ => return Ok(method_not_allowed_response()),
             };

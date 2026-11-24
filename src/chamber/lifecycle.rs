@@ -157,6 +157,7 @@ impl ChamberManager {
     pub fn install(
         &mut self,
         download: &crate::chamber::github::Download,
+        token: Option<&str>,
         expected: Option<&str>,
         app: &App,
     ) -> Result<String, String> {
@@ -167,7 +168,7 @@ impl ChamberManager {
             depth: download.depth,
             directory: staging.clone(),
         };
-        request.run(&self.root)?;
+        request.run(&self.root, token)?;
         let staged = self.root.join(&staging);
         let result = self.install_staged(&staged, expected, app);
         let _ = fs::remove_dir_all(staged);

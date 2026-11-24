@@ -1,5 +1,8 @@
 <script setup>
 import { computed, onMounted, ref, watch, onBeforeUnmount } from 'vue'
+import { postJson, requestJson } from './api.js'
+import GithubAccount from './components/GithubAccount.vue'
+import { useGithubAccount } from './githubAccount.js'
 
 const username = ref('')
 const password = ref('')
@@ -50,30 +53,6 @@ const totalMounts = computed(() => chambers.value.reduce(
   0,
 ))
 
-async function readResponse(response) {
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    throw new Error(data.error || '请求失败，请稍后重试。')
-  }
-  return data
-}
-
-async function requestJson(endpoint, options = {}) {
-  const response = await fetch(endpoint, {
-    credentials: 'same-origin',
-    ...options,
-  })
-  return readResponse(response)
-}
-
-async function postJson(endpoint, payload) {
-  return requestJson(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  })
-}
-
 const proxyLogsChamber = ref('')
 const proxyLogs = ref([])
 const proxyLogsRoute = ref('')
@@ -120,16 +99,19 @@ function closeProxyLogs() {
 const importDialog = ref(null)
 const importButton = ref(null)
 const importStage = ref('')
+const importDialogOpen = ref(false)
 
 function openImportDialog() {
   githubError.value = ''
   githubMessage.value = ''
   importStage.value = ''
+  importDialogOpen.value = true
   importDialog.value.showModal()
 }
 
 function closeImportDialog() {
   if (downloadingGithub.value) return
+  importDialogOpen.value = false
   importDialog.value.close()
   importButton.value?.focus()
 }
@@ -158,6 +140,18 @@ watch(() => github.value.repository, () => {
 })
 onBeforeUnmount(() => { clearTimeout(branchTimer); branchRequestId++ })
 
+function refreshGithubBranches() {
+  if (importDialogOpen.value && github.value.repository.trim() && !downloadingGithub.value && !githubMessage.value) {
+    fetchGithubBranches()
+  }
+}
+
+const githubAuthorization = useGithubAccount(
+  computed(() => !!currentUser.value && activePage.value === 'chambers'
+    && (importDialogOpen.value || (chamberTab.value === 'versions' && !!chamberDetails.value?.current_commit))),
+  refreshGithubBranches,
+)
+
 async function fetchGithubBranches() {
   clearTimeout(branchTimer)
   const requestId = ++branchRequestId
@@ -168,9 +162,16 @@ async function fetchGithubBranches() {
     if (requestId !== branchRequestId) return
     githubBranches.value = data.branches
     githubDefaultBranch.value = data.default_branch || ''
-    github.value.branch = data.branches.includes(data.default_branch) ? data.default_branch : data.branches[0]
+    if (!data.branches.includes(github.value.branch)) {
+      github.value.branch = data.branches.includes(data.default_branch) ? data.default_branch : data.branches[0]
+    }
   } catch (error) {
-    if (requestId === branchRequestId) githubBranchError.value = error.message
+    if (requestId === branchRequestId) {
+      githubBranches.value = []
+      github.value.branch = ''
+      githubDefaultBranch.value = ''
+      githubBranchError.value = error.message
+    }
   } finally {
     if (requestId === branchRequestId) loadingGithubBranches.value = false
   }
@@ -627,6 +628,7 @@ onMounted(async () => {
           <button class="dialog-close" type="button" aria-label="关闭导入弹窗" :disabled="downloadingGithub" @click="closeImportDialog">×</button>
         </div>
         <p id="import-description">仓库将自动下载到 Chamber 目录，以 chamber.toml 中的名称创建子目录。导入后会启用配置的任务和服务。</p>
+        <GithubAccount v-if="importDialogOpen" :authorization="githubAuthorization" :disabled="downloadingGithub" />
         <form class="github-download" :aria-busy="downloadingGithub" @submit.prevent="downloadGithub">
           <fieldset :disabled="downloadingGithub || !!githubMessage">
             <label class="repository-field">GitHub 仓库<input v-model="github.repository" autofocus required placeholder="owner/repo 或 https://github.com/owner/repo" /></label>
@@ -730,6 +732,7 @@ onMounted(async () => {
               <p v-if="!chamberDetails.current_commit" class="version-hint">此 Chamber 使用旧目录布局。升级前需先关停并迁移到 releases / current / data 布局；关停和删除可直接使用。</p>
               <form v-else class="upgrade-form" @submit.prevent="chamberAction('upgrade')">
                 <div class="upgrade-heading"><h4>从 GitHub 升级</h4><p>准备新版本并校验，健康检查失败时自动恢复旧版本。</p></div>
+                <GithubAccount :authorization="githubAuthorization" :disabled="lifecycleBusy" />
                 <div class="upgrade-fields">
                   <label>仓库<input v-model="upgradeRepository" placeholder="owner/repo" required :disabled="lifecycleBusy" /></label>
                   <label>分支<input v-model="upgradeBranch" placeholder="main" required :disabled="lifecycleBusy" /></label>

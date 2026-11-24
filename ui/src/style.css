@@ -517,6 +517,12 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 .dialog-close:disabled { opacity: .4; cursor: wait; }
 .import-dialog > p { font-size: 13px; line-height: 1.7; color: #667085; margin-bottom: 24px; }
 .import-dialog .github-download { margin-bottom: 0; }
+.github-account { margin: 0 0 16px; padding: 12px 14px; border: 1px solid #d8dfda; border-radius: 8px; background: #f6f9f7; font-size: 13px; }
+.github-account-row { display: flex; align-items: center; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; }
+.github-account p { margin: 8px 0 0; overflow-wrap: anywhere; }
+.github-account a { text-decoration: underline; }
+.github-account .inline-link:disabled { opacity: .55; cursor: wait; }
+.github-device-code { font-family: ui-monospace, monospace; letter-spacing: .06em; white-space: nowrap; }
 .import-dialog fieldset { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 16px; }
 .repository-field { grid-column: 1 / -1; }
 .import-dialog input:focus-visible { outline: 2px solid #408d65; outline-offset: 2px; }

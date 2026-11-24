@@ -1,11 +1,58 @@
 use serde::Deserialize;
 use std::{
     fs,
+    os::unix::process::CommandExt,
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+const CREDENTIAL_HELPER: &str = r#"credential.https://github.com.helper=!f() {
+    if [ "$1" = get ]; then
+        printf 'username=x-access-token\npassword=%s\n' "$FORMICARY_GIT_TOKEN"
+    fi
+}; f"#;
+
+fn git_command(token: Option<&str>) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "credential.helper="])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/bin/false")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    if let Some(token) = token {
+        // Keep credentials in the Git subprocess and avoid config that can rewrite its remote.
+        command
+            .args(["-c", CREDENTIAL_HELPER, "-c", "http.followRedirects=false"])
+            .current_dir("/")
+            .env("FORMICARY_GIT_TOKEN", token)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "0")
+            .env("GIT_ALLOW_PROTOCOL", "https")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_SSL_NO_VERIFY")
+            .env_remove("GIT_CURL_VERBOSE");
+        for (key, _) in std::env::vars_os() {
+            if key.as_encoded_bytes().starts_with(b"GIT_TRACE") {
+                command.env_remove(key);
+            }
+        }
+    }
+    command
+}
+
+fn stop_git(child: &mut Child) {
+    // The HTTP transport and credential helper run in the same process group.
+    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+    let _ = child.wait();
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,7 +89,7 @@ impl Download {
         Ok(repository)
     }
 
-    pub fn run(&self, root: &Path) -> Result<(), String> {
+    pub fn run(&self, root: &Path, token: Option<&str>) -> Result<(), String> {
         let repository = self.validate()?;
         let destination = root.join(&self.directory);
         fs::create_dir(&destination).map_err(|error| {
@@ -52,23 +99,25 @@ impl Download {
                 format!("无法创建下载目录：{error}")
             }
         })?;
-        let result = self.clone_into(&repository, &destination);
+        let result = self.clone_into(&repository, &destination, token);
         if result.is_err() {
             let _ = fs::remove_dir_all(&destination);
         }
         result
     }
 
-    fn clone_into(&self, repository: &str, destination: &Path) -> Result<(), String> {
-        let mut command = Command::new("git");
-        command.args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "clone",
-            "--single-branch",
-        ]);
+    fn clone_into(
+        &self,
+        repository: &str,
+        destination: &Path,
+        token: Option<&str>,
+    ) -> Result<(), String> {
+        let destination = std::path::absolute(destination)
+            .map_err(|error| format!("无法解析下载目录：{error}"))?;
+        let mut command = git_command(token);
+        command
+            .args(["-c", "core.hooksPath=/dev/null", "clone", "--single-branch"])
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         if !self.branch.is_empty() {
             command.args(["--branch", &self.branch]);
         }
@@ -79,11 +128,7 @@ impl Download {
             .arg("--")
             .arg(repository)
             .arg(destination)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
             .spawn()
             .map_err(|error| format!("无法启动 Git：{error}"))?;
         let start = Instant::now();
@@ -93,15 +138,17 @@ impl Download {
                     return if status.success() {
                         Ok(())
                     } else {
-                        Err("下载失败，请检查仓库是否公开、分支是否存在以及服务器网络。".into())
+                        Err(format!(
+                            "下载失败，请检查分支和服务器网络。{}",
+                            access_hint(token)
+                        ))
                     };
                 }
                 Ok(None) if start.elapsed() < Duration::from_secs(300) => {
                     thread::sleep(Duration::from_millis(100))
                 }
                 outcome => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop_git(&mut child);
                     return Err(match outcome {
                         Err(error) => format!("无法读取 Git 状态：{error}"),
                         _ => "下载超时，请尝试更小的深度。".into(),
@@ -131,13 +178,19 @@ pub struct Branches {
     default_branch: Option<String>,
 }
 
-pub fn list_branches(repository: &str) -> Result<Branches, String> {
+fn access_hint(token: Option<&str>) -> &'static str {
+    if token.is_some() {
+        "私有仓库需要当前 GitHub 账号和 GitHub App 均有读取权限。"
+    } else {
+        "私有仓库需要先登录 GitHub。"
+    }
+}
+
+pub fn list_branches(repository: &str, token: Option<&str>) -> Result<Branches, String> {
     use std::io::Read;
     let repository = repository_url(repository)?;
-    let mut child = Command::new("git")
+    let mut child = git_command(token)
         .args([
-            "-c",
-            "credential.helper=",
             "ls-remote",
             "--symref",
             "--",
@@ -145,10 +198,7 @@ pub fn list_branches(repository: &str) -> Result<Branches, String> {
             "HEAD",
             "refs/heads/*",
         ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("无法启动 Git：{error}"))?;
     let stdout = child.stdout.take().unwrap();
@@ -173,14 +223,17 @@ pub fn list_branches(repository: &str) -> Result<Branches, String> {
                 thread::sleep(Duration::from_millis(50))
             }
             outcome => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(if matches!(outcome, Ok(None)) {
-                    "获取分支超时，请重试。"
-                } else {
-                    "无法获取分支，请检查公开仓库地址和服务器网络。"
+                if !matches!(outcome, Ok(Some(_))) {
+                    stop_git(&mut child);
                 }
-                .into());
+                return Err(if matches!(outcome, Ok(None)) {
+                    "获取分支超时，请重试。".into()
+                } else {
+                    format!(
+                        "无法获取分支，请检查仓库地址和服务器网络。{}",
+                        access_hint(token)
+                    )
+                });
             }
         }
     }
@@ -231,6 +284,26 @@ mod tests {
             depth: Some(1),
         }
     }
+
+    #[test]
+    fn git_credentials_are_scoped_to_github() {
+        use std::io::Write;
+
+        for (host, expected) in [("github.com", true), ("github.com.example", false)] {
+            let mut child = git_command(Some("test-token"))
+                .args(["credential", "fill"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            writeln!(child.stdin.take().unwrap(), "protocol=https\nhost={host}\n").unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(output.status.success(), expected);
+            let credentials = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(credentials.contains("password=test-token\n"), expected);
+        }
+    }
+
     /// 验证远端引用能识别默认分支、保留含斜杠的分支名，并拒绝空分支列表。
     /// Verifies that remote references identify the default branch, preserve branch names containing slashes, and reject an empty branch list.
     #[test]
@@ -274,7 +347,7 @@ mod tests {
         fs::write(root.join("source/keep.txt"), "keep").unwrap();
         assert!(
             download("owner/repo")
-                .run(&root)
+                .run(&root, None)
                 .unwrap_err()
                 .contains("已存在")
         );
